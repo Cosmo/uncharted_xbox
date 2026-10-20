@@ -915,8 +915,8 @@ static int64_t find_unique_pattern(uint64_t image_size, const char *pattern) {
  * (github.com/bc160201983/Uncharted-The-Nathan-Drake-Collection-PC-port, JOB_SLEEP_PATCHES in
  * tools/probe_uncharted.py) on 01.09. The retail 01.02 (the EU dump) has the same three sites:
  * its worker loop is identical, but its re-check loads the manager through r13 (not r15) and its
- * submit path tests rdi and jumps with a short je. A build that matches no set keeps spinning.
- * BB_JOB_SLEEP=0 keeps the spinning workers. */
+ * submit path tests rdi and jumps with a short je. A build that matches no set keeps spinning,
+ * and the message names the site every set missed. BB_JOB_SLEEP=0 keeps the spinning workers. */
 static void patch_job_sleep(uint64_t image_size) {
     const char *env=getenv("BB_JOB_SLEEP");
     if (env && env[0]=='0') { printf("Job workers: spin while idle (BB_JOB_SLEEP=0)\n"); return; }
@@ -941,7 +941,11 @@ static void patch_job_sleep(uint64_t image_size) {
             {"job submission wakes them","807f5900 74?? 4883c760 beffffffff",4,1,2,{0x74},{0x90,0x90}},
         },
     };
+    static const char *const versions[]={"01.09","01.02"}; /* one per set above */
+    _Static_assert(sizeof(versions)/sizeof(versions[0])==sizeof(builds)/sizeof(builds[0]),
+                   "one version name per pattern set");
     const size_t nbuilds=sizeof(builds)/sizeof(builds[0]);
+    const char *miss[sizeof(builds)/sizeof(builds[0])]={0};
     for (size_t b=0;b<nbuilds;++b) {
         int64_t at[3];
         size_t i;
@@ -952,8 +956,12 @@ static void patch_job_sleep(uint64_t image_size) {
                 break;
         }
         if (i<3) {
+            miss[b]=builds[b][i].name;
             if (b+1<nbuilds) continue;
-            printf("Job workers: %s not found, idle workers keep spinning\n",builds[b][i].name);
+            /* Name every set: a build that matches none should not be pointed at the last one only. */
+            printf("Job workers: no known build matched (");
+            for (size_t k=0;k<nbuilds;++k) printf("%s%s: %s not found",k?", ":"",versions[k],miss[k]);
+            printf("), idle workers keep spinning\n");
             return;
         }
         for (i=0;i<3;++i) {
