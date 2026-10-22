@@ -711,14 +711,35 @@ static void GenerateOfflineSrt(Info& info, PassInfo& pass_info) {
         const auto* uses = pass_info.GetUsesAsPointer(tree);
         if (!uses)
             throw std::runtime_error("Offline descriptor pointer has no uses");
+        boost::container::small_vector<IR::Inst*, 8> windowed;
         for (auto [offset, use] : *uses) {
-            if (!offset.IsImmediate())
+            if (!offset.IsImmediate()) {
+                // bbport: as in the runtime walker, a read whose offset varies per lane reads a
+                // copy of the block's first ReadConstWindowDwords dwords.
+                if (use->GetOpcode() == IR::Opcode::ReadConst && !IsBindTimeOffset(offset) &&
+                    !pass_info.GetUsesAsPointer(use)) {
+                    windowed.push_back(use);
+                    continue;
+                }
                 throw std::runtime_error("Offline descriptor table has a dynamic offset");
+            }
             if (info.offline_reads.size() >= 16384)
                 throw std::runtime_error("Offline descriptor layout exceeds limit");
             info.flattened_ud_buf.push_back(memory->Read32(address + u64(offset.U32()) * 4));
             info.offline_reads.push_back({path, offset.U32(), pass_info.dst_off_dw});
             SetFlatbufOffset(use, pass_info.dst_off_dw++);
+        }
+        if (!windowed.empty()) {
+            if (info.offline_reads.size() + ReadConstWindowDwords > 16384)
+                throw std::runtime_error("Offline descriptor layout exceeds limit");
+            const u32 start = pass_info.dst_off_dw;
+            for (u32 i = 0; i < ReadConstWindowDwords; ++i) {
+                info.flattened_ud_buf.push_back(memory->Read32(address + u64(i) * 4));
+                info.offline_reads.push_back({path, i, pass_info.dst_off_dw++});
+            }
+            for (IR::Inst* use : windowed) {
+                use->SetFlags<u32>(start | ReadConstWindowFlag);
+            }
         }
         for (auto [offset, use] : *uses) {
             if (pass_info.GetUsesAsPointer(use)) {

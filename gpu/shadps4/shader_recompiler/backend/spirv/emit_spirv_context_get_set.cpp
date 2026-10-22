@@ -50,9 +50,16 @@ static std::pair<Id, bool> OutputAttrComponentType(EmitContext& ctx, IR::Attribu
 Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
     const u32 index = ctx.binding.user_data + ctx.info.ud_mask.Index(reg);
     const u32 half = PushData::UdRegsIndex + (index >> 2);
+    // bbport: a prepared template (BbPrecompile) is relocated to the user-data start it is
+    // loaded at, so its push-data position stays open until then.
+    const bool parametric = ctx.info.offline_memory && ctx.info.offline_memory->Parametric();
+    const auto position = [&](u32 value, u32 part) {
+        return parametric ? EmitOfflineConstant(ctx, value, OfflineSlot::UserData + index * 2 + part)
+                          : ctx.ConstU32(value);
+    };
     const Id ud_ptr{ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]),
-                                      ctx.push_data_block, ctx.ConstU32(half),
-                                      ctx.ConstU32(index & 3))};
+                                      ctx.push_data_block, position(half, 0),
+                                      position(index & 3, 1))};
     const Id ud_reg{ctx.OpLoad(ctx.U32[1], ud_ptr)};
     ctx.Name(ud_reg, fmt::format("ud_{}", u32(reg)));
     return ud_reg;

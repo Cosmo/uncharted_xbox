@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include "common/types.h"
+#include "video_core/amdgpu/pixel_format.h"
+#include <array>
+#include <optional>
+#include <utility>
 #include <vector>
 
 namespace Shader {
@@ -20,6 +24,35 @@ constexpr u32 Stride = 0x3000;
 constexpr u32 Swizzle = 0x4000; // vertex attribute * 4 + component
 constexpr u32 BufferPresent = 0x5000;
 constexpr u32 ImagePresent = 0x6000;
+constexpr u32 BufferBinding = 0x7000; // buffer * 4 + part: push-data member, component, bit offset
+constexpr u32 UserData = 0x7400;      // register index * 2 + part: push-data member, component
+constexpr u32 BufferFormat = 0x7800;  // buffer: its TemplateBufferFormat
+}
+
+// The formats a prepared formatted buffer load (Uncharted's vertex streams) is ready for; the
+// template takes the descriptor's when it is frozen. None of them needs a number conversion.
+inline std::optional<u32> TemplateBufferFormat(AmdGpu::DataFormat data, AmdGpu::NumberFormat number) {
+    using enum AmdGpu::DataFormat;
+    using enum AmdGpu::NumberFormat;
+    constexpr std::array<std::pair<AmdGpu::DataFormat, AmdGpu::NumberFormat>, 12> formats{{
+        {Format32, Float}, {Format32_32, Float}, {Format32_32_32, Float},
+        {Format32_32_32_32, Float}, {Format16_16, Float}, {Format16_16_16_16, Float},
+        {Format8_8_8_8, Unorm}, {Format16_16, Unorm}, {Format8_8_8_8, Snorm},
+        {Format16_16, Snorm}, {Format16_16_16_16, Snorm}, {Format8_8_8_8, Uint},
+    }};
+    for (const auto& [d, n] : formats)
+        if (d == data && n == number)
+            return u32(data) | u32(number) << 8;
+    return std::nullopt;
+}
+template <class Visit> void ForEachTemplateBufferFormat(Visit&& visit) {
+    using enum AmdGpu::DataFormat;
+    using enum AmdGpu::NumberFormat;
+    for (const auto data : {Format32, Format32_32, Format32_32_32, Format32_32_32_32, Format16_16,
+                            Format16_16_16_16, Format8_8_8_8})
+        for (const auto number : {Float, Unorm, Snorm, Uint})
+            if (const auto code = TemplateBufferFormat(data, number))
+                visit(data, number, *code);
 }
 
 struct SrtRead {

@@ -6,7 +6,7 @@
 
 namespace BbPrecompile {
 bool FreezeTemplate(std::span<const u32> input, const ConstantResolver &resolve,
-                    std::vector<u32> &output) {
+                    std::vector<u32> &output, u32 binding_offset) {
   if (input.size() < 5 || input[0] != 0x07230203)
     return false;
   std::unordered_map<u32, u32> slots;
@@ -42,6 +42,10 @@ bool FreezeTemplate(std::span<const u32> input, const ConstantResolver &resolve,
       checked.insert(checked.end(), {(4u << 16) | u32(spv::Op::OpConstant),
                                      input[at + 1], input[at + 2], *value});
       slots.erase(slot);
+    } else if (opcode == spv::Op::OpDecorate && size == 4 &&
+               input[at + 2] == u32(spv::Decoration::Binding)) {
+      checked.insert(checked.end(), {input[at], input[at + 1], input[at + 2],
+                                     input[at + 3] + binding_offset});
     } else if (opcode == spv::Op::OpSpecConstantTrue ||
                opcode == spv::Op::OpSpecConstantFalse ||
                opcode == spv::Op::OpSpecConstantComposite ||
@@ -92,6 +96,18 @@ std::optional<u32> DescriptorConstant(u32 slot, const Shader::Info &info) {
     const auto &desc = info.buffers[index];
     const auto sharp = desc.GetSharp(info);
     return u32(desc.IsSpecial() || (sharp && sharp.GetSize()));
+  }
+  if (slot >= OfflineSlot::BufferFormat &&
+      slot < OfflineSlot::BufferFormat + NUM_BUFFERS) {
+    const u32 index = slot - OfflineSlot::BufferFormat;
+    if (index >= info.buffers.size())
+      return {};
+    const auto sharp = info.buffers[index].GetSharp(info);
+    if (!sharp || !sharp.GetSize()) // absent: the load reads zero (BufferPresent)
+      return TemplateBufferFormat(AmdGpu::DataFormat::Format32, AmdGpu::NumberFormat::Float);
+    if (sharp.GetNumberConversion() != AmdGpu::NumberConversion::None)
+      return {};
+    return TemplateBufferFormat(sharp.GetDataFmt(), sharp.GetNumberFmt());
   }
   if (slot >= OfflineSlot::ImagePresent &&
       slot < OfflineSlot::ImagePresent + NUM_IMAGES) {

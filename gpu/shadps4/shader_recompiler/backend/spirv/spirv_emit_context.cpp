@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -253,11 +254,19 @@ void EmitContext::DefineBufferProperties() {
         const u32 half = PushData::BufOffsetIndex + (binding >> 4);
         const u32 comp = (binding & 0xf) >> 2;
         const u32 offset = (binding & 0x3) << 3;
+        // bbport: a prepared template (BbPrecompile) is relocated to the buffer binding it is
+        // loaded at, so its push-data position stays open until then.
+        const bool parametric = info.offline_memory && info.offline_memory->Parametric();
+        const auto position = [&](u32 value, u32 part) {
+            return parametric ? EmitOfflineConstant(*this, value,
+                                                    OfflineSlot::BufferBinding + binding * 4 + part)
+                              : ConstU32(value);
+        };
         const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
-                                   push_data_block, ConstU32(half), ConstU32(comp))};
+                                   push_data_block, position(half, 0), position(comp, 1))};
         const Id value{OpLoad(U32[1], ptr)};
 
-        const Id buf_offset{OpBitFieldUExtract(U32[1], value, ConstU32(offset), ConstU32(8U))};
+        const Id buf_offset{OpBitFieldUExtract(U32[1], value, position(offset, 2), ConstU32(8U))};
         Name(buf_offset, fmt::format("buf{}_off", binding));
         buffer.Offset(PointerSize::B8) = buf_offset;
 

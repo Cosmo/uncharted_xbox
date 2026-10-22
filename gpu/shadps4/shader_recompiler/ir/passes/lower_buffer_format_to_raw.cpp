@@ -17,6 +17,7 @@ struct FormatInfo {
     AmdGpu::NumberConversion num_conversion;
     u32 num_components;
     u32 offline_swizzle = std::numeric_limits<u32>::max();
+    u32 offline_format = std::numeric_limits<u32>::max();
 };
 
 static bool IsBufferFormatLoad(const IR::Inst& inst) {
@@ -27,8 +28,10 @@ static bool IsBufferFormatStore(const IR::Inst& inst) {
     return inst.GetOpcode() == IR::Opcode::StoreBufferFormatF32;
 }
 
-static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, const IR::U32 address,
-                                  const IR::BufferInstInfo info, const FormatInfo& format_info) {
+// The four components a formatted load reads, before the swizzle.
+static std::array<IR::Value, 4> LoadComponents(IR::IREmitter& ir, const IR::Value handle,
+                                               const IR::U32 address, const IR::BufferInstInfo info,
+                                               const FormatInfo& format_info) {
     IR::Value interpreted;
     switch (format_info.data_format) {
     case AmdGpu::DataFormat::FormatInvalid:
@@ -91,17 +94,41 @@ static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, con
     }
 
     // Pad to 4 components and apply additional modifications.
-    boost::container::static_vector<IR::Value, 4> components;
+    std::array<IR::Value, 4> components;
     for (u32 i = 0; i < 4; i++) {
         if (i < format_info.num_components) {
             const auto component =
                 IR::F32{format_info.num_components == 1 ? interpreted
                                                         : ir.CompositeExtract(interpreted, i)};
-            components.push_back(
-                ApplyReadNumberConversion(ir, component, format_info.num_conversion));
+            components[i] = ApplyReadNumberConversion(ir, component, format_info.num_conversion);
         } else {
-            components.push_back(ir.Imm32(0.f));
+            components[i] = ir.Imm32(0.f);
         }
+    }
+    return components;
+}
+
+static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, const IR::U32 address,
+                                  const IR::BufferInstInfo info, const FormatInfo& format_info) {
+    auto components = LoadComponents(ir, handle, address, info, format_info);
+    if (format_info.offline_format != std::numeric_limits<u32>::max()) {
+        // bbport: a prepared template (BbPrecompile) reads the stream in each format it is
+        // ready for; the frozen template keeps the descriptor's and drops the others.
+        const auto baseline =
+            TemplateBufferFormat(format_info.data_format, format_info.num_format).value_or(0);
+        const auto selector = ir.OfflineConstant(baseline, format_info.offline_format);
+        ForEachTemplateBufferFormat([&](AmdGpu::DataFormat data, AmdGpu::NumberFormat number,
+                                        u32 code) {
+            auto candidate = format_info;
+            candidate.data_format = data;
+            candidate.num_format = number;
+            candidate.num_conversion = AmdGpu::NumberConversion::None;
+            candidate.num_components = AmdGpu::NumComponents(data);
+            const auto values = LoadComponents(ir, handle, address, info, candidate);
+            const auto chosen = ir.IEqual(selector, ir.Imm32(code));
+            for (u32 i = 0; i < 4; ++i)
+                components[i] = ir.Select(chosen, values[i], components[i]);
+        });
     }
     if (format_info.offline_swizzle != std::numeric_limits<u32>::max()) {
         const std::array<u32, 4> defaults{u32(format_info.swizzle.r), u32(format_info.swizzle.g),
@@ -116,7 +143,9 @@ static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, con
         }
         return ir.CompositeConstruct(selected[0], selected[1], selected[2], selected[3]);
     }
-    const auto swizzled = ApplySwizzle(ir, ir.CompositeConstruct(components), format_info.swizzle);
+    const auto swizzled = ApplySwizzle(
+        ir, ir.CompositeConstruct(components[0], components[1], components[2], components[3]),
+        format_info.swizzle);
     return swizzled;
 }
 
@@ -228,6 +257,10 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
                                   !is_inst_typed && IsBufferFormatLoad(inst)
                               ? OfflineSlot::Swizzle + 32 * 4 + inst.Arg(0).U32() * 4
                               : std::numeric_limits<u32>::max(),
+        .offline_format = info.offline_memory && info.offline_memory->Parametric() &&
+                                 !is_inst_typed && IsBufferFormatLoad(inst)
+                             ? OfflineSlot::BufferFormat + inst.Arg(0).U32()
+                             : std::numeric_limits<u32>::max(),
     };
 
     if (data_format == AmdGpu::DataFormat::FormatInvalid) {

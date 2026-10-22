@@ -16,7 +16,9 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <miniz.h>
 #include <map>
 #include <optional>
 #include <unordered_map>
@@ -46,6 +48,13 @@ u64 U64(const u8* p) {
 u16 U16(const u8* p) {
     u16 v;
     std::memcpy(&v, p, 2);
+    return v;
+}
+// Big-endian fields of PSARC archives.
+u64 BigEndian(const u8* p, u32 bytes) {
+    u64 v = 0;
+    for (u32 i = 0; i < bytes; ++i)
+        v = v << 8 | p[i];
     return v;
 }
 struct Candidate {
@@ -201,10 +210,14 @@ bool HasExtension(const std::string& name, const char* extension) {
     return name.size() > length && Matches(name, name.size() - length, extension);
 }
 /// The files of one game (its data folder, u1data, u2data or u3data) that hold its shaders:
-/// build/main/*.psarc and the actor and level packs (build/main/actorNN/ps4, pakNN/ps4). The
+/// its *.psarc archives (in the folder and in build/main; the engine's own shaders are in
+/// build/main/core.psarc) and the actor and level packs (build/main/actorNN/ps4, pakNN/ps4). The
 /// texture and sound archives (most of the data) have none.
 std::vector<fs::path> Archives(const fs::path& root) {
     std::vector<fs::path> result;
+    for (const auto& [name, folder] : List(root))
+        if (!folder && HasExtension(name, ".psarc"))
+            result.push_back(root / name);
     const auto main = root / "build" / "main";
     for (const auto& [name, folder] : List(main)) {
         if (!folder && HasExtension(name, ".psarc")) {
@@ -240,36 +253,42 @@ s64 Tell(FILE* file) {
     return ftello(file);
 #endif
 }
-void Scan(const fs::path& path, std::unordered_set<u64>& all,
-          std::unordered_map<u64, Candidate>& candidates,
-          std::unordered_map<u64, Candidate>& vertices) {
-    FILE* file = OpenDump(path);
-    if (!file)
-        throw std::runtime_error("Cannot read shader archive: " + path.filename().string());
-    const auto close = std::unique_ptr<FILE, decltype(&std::fclose)>(file, std::fclose);
-    if (Seek(file, 0, SEEK_END))
-        throw std::runtime_error("Cannot seek shader archive");
-    const auto length = Tell(file);
-    if (length < 0)
-        throw std::runtime_error("Cannot size shader archive");
+// Reads out.size() bytes at an offset of a scanned stream: a pack, or a file in an archive.
+using ReadAt = std::function<void(u64 offset, std::span<u8> out)>;
+// The vertex shaders' exports of one file (all files of an archive) in order: a fragment
+// shader's inputs come from the vertex shader right before it, else (Uncharted keeps fewer pairs
+// together than God of War III) from another of the file that exports all of them, also one
+// found later.
+struct Pairing {
+    std::vector<std::unordered_map<u32, u32>> exports_seen;
+    std::vector<FragmentShader> pending;
+    void Finish(std::unordered_map<u64, Candidate>& candidates) {
+        for (auto& fragment : pending)
+            for (const auto& exports : exports_seen)
+                if (ResolveInputs(fragment, exports)) {
+                    candidates.try_emplace(fragment.candidate.hash, std::move(fragment.candidate));
+                    break;
+                }
+        pending.clear();
+    }
+};
+void ScanStream(u64 length, const ReadAt& read, Pairing& pairing, std::unordered_set<u64>& all,
+                std::unordered_map<u64, Candidate>& candidates,
+                std::unordered_map<u64, Candidate>& vertices) {
     // Uncharted's packs hold the shaders as the PS4 toolchain writes them (header, code, OrbShdr
     // footer) between other data: the whole file is searched, in chunks that overlap by more than
     // a program and its header so that none is cut, keeping Xbox memory bounded.
     constexpr u64 ChunkBytes = 64ull << 20, Reach = 70ull << 10, HeaderReach = 4096;
     std::vector<u8> buffer;
-    // The vertex shaders' exports in file order: a fragment shader's inputs come from the vertex
-    // shader right before it, else (Uncharted keeps fewer pairs together than God of War III) from
-    // another of the file that exports all of them, also one found later.
-    std::vector<std::unordered_map<u32, u32>> exports_seen;
+    auto& exports_seen = pairing.exports_seen;
+    auto& pending = pairing.pending;
     std::optional<Candidate> last_vertex;
     std::unordered_map<u32, u32> last_exports;
-    std::vector<FragmentShader> pending;
     u64 base = 0, handled = 0; // file offset of buffer[0]; programs before `handled` are done
     while (base < u64(length)) {
         const u64 size = std::min<u64>(ChunkBytes, u64(length) - base);
         buffer.resize(size);
-        if (Seek(file, s64(base), SEEK_SET) || std::fread(buffer.data(), 1, size, file) != size)
-            throw std::runtime_error("Cannot read shader archive: " + path.filename().string());
+        read(base, buffer);
         const bool last = base + size >= u64(length);
         const u64 limit = last ? size : size - Reach; // later programs: the next chunk
         for (u64 at = handled > base ? handled - base : 0; at < limit && at + 8 <= size; ++at) {
@@ -285,6 +304,9 @@ void Scan(const fs::path& path, std::unordered_set<u64>& all,
                 if (VertexExports(buffer, *program, exports, &vertex)) {
                     exports_seen.push_back(exports);
                     last_exports = std::move(exports);
+                    // Vertex templates move to any binding start, so every vertex shader is
+                    // prepared, also one without a pixel shader of its own.
+                    vertices.try_emplace(vertex.hash, vertex);
                     last_vertex = std::move(vertex);
                 } else {
                     last_vertex.reset();
@@ -295,10 +317,10 @@ void Scan(const fs::path& path, std::unordered_set<u64>& all,
                     for (auto it = exports_seen.rbegin(); !resolved && it != exports_seen.rend(); ++it)
                         resolved = ResolveInputs(*fragment, *it);
                     if (resolved) {
-                        if (last_vertex) {
-                            last_vertex->fragment = fragment->candidate.hash;
-                            vertices.try_emplace(last_vertex->hash, std::move(*last_vertex));
-                        }
+                        if (last_vertex)
+                            if (auto paired = vertices.find(last_vertex->hash);
+                                paired != vertices.end() && !paired->second.fragment)
+                                paired->second.fragment = fragment->candidate.hash;
                         candidates.try_emplace(fragment->candidate.hash, std::move(fragment->candidate));
                     } else {
                         pending.push_back(std::move(*fragment));
@@ -312,12 +334,117 @@ void Scan(const fs::path& path, std::unordered_set<u64>& all,
         handled = base + limit;
         base = handled - HeaderReach; // the headers before the next chunk's first programs
     }
-    for (auto& fragment : pending)
-        for (const auto& exports : exports_seen)
-            if (ResolveInputs(fragment, exports)) {
-                candidates.try_emplace(fragment.candidate.hash, std::move(fragment.candidate));
-                break;
+}
+/// A PSARC archive (Uncharted's .psarc) keeps its files in zlib-compressed blocks; each file is
+/// scanned as a stream of its own. Returns false for other files.
+bool ScanPsarc(FILE* file, u64 length, const std::string& name, Pairing& pairing,
+               std::unordered_set<u64>& all, std::unordered_map<u64, Candidate>& candidates,
+               std::unordered_map<u64, Candidate>& vertices) {
+    const auto fail = [&](const char* what) {
+        return std::runtime_error(std::string(what) + ": " + name);
+    };
+    const auto read_file = [&](u64 offset, std::span<u8> out) {
+        if (Seek(file, s64(offset), SEEK_SET) ||
+            std::fread(out.data(), 1, out.size(), file) != out.size())
+            throw fail("Cannot read shader archive");
+    };
+    std::array<u8, 32> header;
+    if (length < header.size())
+        return false;
+    read_file(0, header);
+    if (std::memcmp(header.data(), "PSAR", 4))
+        return false;
+    if (std::memcmp(header.data() + 8, "zlib", 4))
+        throw fail("Unsupported shader archive compression");
+    const u64 toc_length = BigEndian(&header[12], 4), entry_size = BigEndian(&header[16], 4),
+              entries = BigEndian(&header[20], 4), block_size = BigEndian(&header[24], 4);
+    if (entry_size < 30 || block_size < 1024 || block_size > (16u << 20) ||
+        toc_length > length || toc_length < header.size() + entries * entry_size)
+        throw fail("Invalid shader archive table");
+    std::vector<u8> toc(toc_length - header.size());
+    read_file(header.size(), toc);
+    // Stored size of every block (0: a whole block), after the file table.
+    const u32 width = block_size <= 0x10000 ? 2 : block_size <= 0x1000000 ? 3 : 4;
+    std::vector<u32> stored;
+    for (u64 at = entries * entry_size; at + width <= toc.size(); at += width)
+        stored.push_back(u32(BigEndian(&toc[at], width)));
+    std::vector<u8> packed, block;
+    for (u64 entry = 0; entry < entries; ++entry) {
+        const u8* e = &toc[entry * entry_size];
+        const u64 first = BigEndian(e + 16, 4), size = BigEndian(e + 20, 5),
+                  offset = BigEndian(e + 25, 5);
+        const u64 count = (size + block_size - 1) / block_size;
+        if (first + count > stored.size() || offset > length)
+            throw fail("Invalid shader archive file");
+        std::vector<u64> starts(count); // file offset of each block
+        for (u64 i = 0, at = offset; i < count; ++i) {
+            starts[i] = at;
+            at += stored[first + i] ? stored[first + i] : block_size;
+        }
+        u64 cached = ~0ull;
+        const auto read = [&](u64 at, std::span<u8> out) {
+            while (!out.empty()) {
+                const u64 index = at / block_size, within = at % block_size;
+                if (index >= count)
+                    throw fail("Shader archive read past a file");
+                const u64 want = std::min(block_size, size - index * block_size);
+                if (index != cached) {
+                    const u64 bytes = stored[first + index] ? stored[first + index] : block_size;
+                    if (bytes > want && stored[first + index])
+                        throw fail("Invalid shader archive block");
+                    packed.resize(bytes);
+                    read_file(starts[index], packed);
+                    block.resize(want);
+                    if (bytes == want) {
+                        std::memcpy(block.data(), packed.data(), want);
+                    } else {
+                        mz_ulong unpacked = mz_ulong(want);
+                        if (mz_uncompress(block.data(), &unpacked, packed.data(), mz_ulong(bytes)) !=
+                                MZ_OK ||
+                            unpacked != want)
+                            throw fail("Corrupt shader archive block");
+                    }
+                    cached = index;
+                }
+                const u64 take = std::min<u64>(out.size(), want - within);
+                std::memcpy(out.data(), block.data() + within, take);
+                out = out.subspan(take);
+                at += take;
             }
+        };
+        if (size)
+            ScanStream(size, read, pairing, all, candidates, vertices);
+    }
+    return true;
+}
+void Scan(const fs::path& path, std::unordered_set<u64>& all,
+          std::unordered_map<u64, Candidate>& candidates,
+          std::unordered_map<u64, Candidate>& vertices) {
+    const auto name = path.filename().string();
+    FILE* file = OpenDump(path);
+    if (!file)
+        throw std::runtime_error("Cannot read shader archive: " + name);
+    const auto close = std::unique_ptr<FILE, decltype(&std::fclose)>(file, std::fclose);
+    if (Seek(file, 0, SEEK_END))
+        throw std::runtime_error("Cannot seek shader archive");
+    const auto length = Tell(file);
+    if (length < 0)
+        throw std::runtime_error("Cannot size shader archive");
+    Pairing pairing;
+    bool archive = true;
+    try {
+        archive = ScanPsarc(file, u64(length), name, pairing, all, candidates, vertices);
+    } catch (const std::exception& error) {
+        // An archive this reader cannot follow only costs its shaders.
+        std::printf("Shader archive skipped: %s\n", error.what());
+    }
+    if (!archive)
+        ScanStream(u64(length), [&](u64 offset, std::span<u8> out) {
+            if (Seek(file, s64(offset), SEEK_SET) ||
+                std::fread(out.data(), 1, out.size(), file) != out.size())
+                throw std::runtime_error("Cannot read shader archive: " + name);
+        }, pairing, all, candidates, vertices);
+    pairing.Finish(candidates);
 }
 RuntimeInfo Runtime(const Candidate& c, u32 target) {
     RuntimeInfo r{};
@@ -363,7 +490,7 @@ RuntimeInfo Runtime(const Candidate& c, u32 target) {
         }
     return r;
 }
-u64 RuntimeKey(const RuntimeInfo& r, Backend::Bindings start = {}) {
+u64 RuntimeKey(const RuntimeInfo& r) {
     std::vector<u32> words;
     auto add = [&](auto value) { words.push_back(u32(value)); };
     add(r.hw_stage);
@@ -376,7 +503,7 @@ u64 RuntimeKey(const RuntimeInfo& r, Backend::Bindings start = {}) {
     add(r.props.num_input_vgprs);
     add(r.props.num_allocated_vgprs);
     if (r.hw_stage == HwStage::Vertex) {
-        add(start.unified); add(start.buffer); add(start.user_data);
+        // Templates are relocated to the binding starts when loaded (TryTemplate).
         const auto& v = r.hw.vs;
         add(v.num_outputs);
         for (const auto& output : v.outputs) for (const auto value : output) add(value);
@@ -384,7 +511,14 @@ u64 RuntimeKey(const RuntimeInfo& r, Backend::Bindings start = {}) {
         add(v.user_clip_plane_mask); add(v.motion_vectors);
         add(r.sw.vs.step_rate_0); add(r.sw.vs.step_rate_1);
         add(r.sw.vs.vertex_sgpr_offset); add(r.sw.vs.instance_sgpr_offset);
-        add(r.sw.vs.tess_emulated_primitive);
+        // Rect and quad emulation only drops exports of these outputs.
+        bool emulation_matters = false;
+        for (u32 o = 0; o < v.num_outputs; ++o)
+            for (const auto output : v.outputs[o])
+                emulation_matters |= output == Output::PointSize ||
+                                     output == Output::RenderTargetIndex ||
+                                     output == Output::ViewportIndex;
+        add(r.sw.vs.tess_emulated_primitive && emulation_matters);
         return XXH3_64bits(words.data(), words.size() * 4);
     }
     const auto& f = r.hw.fs;
@@ -479,10 +613,9 @@ void Write(const fs::path& folder, const Candidate& c, const RuntimeInfo& runtim
     fs::rename(temp, path);
 }
 Summary PrepareVertices(const std::unordered_map<u64, Candidate>& vertices,
-                        const std::unordered_map<u64, Candidate>& fragments,
                         const fs::path& cache, const Profile& profile, u64 parent_library,
                         const Update& update) {
-    struct Job { const Candidate* shader; std::vector<Backend::Bindings> starts; u32 classes; };
+    struct Job { const Candidate* shader; u32 classes; };
     std::vector<Job> jobs;
     std::vector<std::array<u64, 3>> inventory;
     std::unordered_set<u64> distinct;
@@ -491,16 +624,12 @@ Summary PrepareVertices(const std::unordered_map<u64, Candidate>& vertices,
     progress.vertex = true;
     Summary result;
     for (const auto& [hash, c] : vertices) {
-        const auto paired = fragments.find(c.fragment);
-        if (paired == fragments.end()) { ++result.skipped; continue; }
-        auto starts = TemplateBindingVariants(cache, c.fragment, paired->second.code_hash, profile);
-        if (starts.empty()) { ++result.skipped; continue; }
         const bool bones = std::ranges::any_of(c.parameters, [](u32 s) { return (s & 255) == 15; });
         const u32 classes = bones ? 3 : 1;
-        progress.total += starts.size() * 2 * classes;
+        progress.total += 2 * classes;
         inventory.push_back({hash, c.signature, c.fragment});
         distinct.insert(c.code_hash);
-        jobs.push_back({&c, std::move(starts), classes});
+        jobs.push_back({&c, classes});
     }
     result.supported = jobs.size();
     result.distinct_programs = distinct.size();
@@ -526,7 +655,7 @@ Summary PrepareVertices(const std::unordered_map<u64, Candidate>& vertices,
     for (const auto& job : jobs) {
         const auto& c = *job.shader;
         bool ready = false;
-        for (const auto& start : job.starts) for (u32 depth = 0; depth < 2; ++depth)
+        for (u32 depth = 0; depth < 2; ++depth)
             for (u32 bone_class = 0; bone_class < job.classes; ++bone_class) {
                 try {
                     RuntimeInfo runtime{};
@@ -538,7 +667,7 @@ Summary PrepareVertices(const std::unordered_map<u64, Candidate>& vertices,
                         pgm.settings.num_user_regs, pgm.settings.vgpr_comp_cnt, pgm.NumVgprs()};
                     runtime.hw.vs.emulate_depth_negative_one_to_one = depth;
                     if (runtime.props.num_user_data > 16) throw std::runtime_error("Invalid vertex register count");
-                    const auto key = RuntimeKey(runtime, start);
+                    const auto key = RuntimeKey(runtime);
                     const std::array<u64, 3> identity{c.signature, key, bone_class};
                     if (auto found = compiled.find(identity); found != compiled.end()) {
                         writer.Alias(found->second, c.hash);
@@ -550,15 +679,23 @@ Summary PrepareVertices(const std::unordered_map<u64, Candidate>& vertices,
                         info.sw_stage = SwStage::Vertex;
                         info.pgm_hash = c.hash;
                         info.pgm_base = 0;
-                        AssetInputs inputs(c.usages, 0, true);
+                        AssetInputs inputs(c.usages, 0, true, c.code);
                         info.offline_memory = &inputs;
                         info.offline_descriptor_snapshot = true;
                         info.user_data = inputs.UserData().first(runtime.props.num_user_data);
-                        auto fetch = AssetFetch(c.parameters, c.usages, bone_class != 0, bone_class == 2);
+                        // Uncharted's vertex shaders read their vertices through a resource
+                        // table themselves; only shaders with a fetch shader get its layout.
+                        const bool fetches = std::ranges::any_of(
+                            c.usages, [](u32 usage) { return (usage & 255) == 0x12; });
+                        auto fetch = fetches ? AssetFetch(c.parameters, c.usages, bone_class != 0,
+                                                          bone_class == 2)
+                                             : Gcn::FetchShaderSnapshot{};
                         fetch.info = &info;
                         Gcn::ScopedFetchShaderSnapshot scope(fetch);
                         const auto ir = TranslateProgram(c.code, pools, info, runtime, profile);
-                        auto binding = start;
+                        // At binding start 0, moved to the start after whichever pixel shader
+                        // the game pairs it with when loaded (TryTemplate).
+                        Backend::Bindings binding{};
                         const auto spirv = Backend::SPIRV::EmitSPIRV(profile, runtime, ir, binding);
                         const auto location = writer.Write(c.code_hash, key, info, spirv, &fetch);
                         writer.Alias(location, c.hash);
@@ -628,9 +765,12 @@ Summary Prepare(const fs::path& dump, const fs::path& cache, const Profile& prof
         inventory.push_back({hash, c.signature});
     }
     std::sort(inventory.begin(), inventory.end());
+    // The version of what preparation assumes (descriptor defaults, table layouts): a library
+    // prepared by an older build is prepared again. The vertex library hashes this one.
+    inventory.push_back({0x75726470, 6});
     const u64 library = XXH3_64bits(inventory.data(), inventory.size() * sizeof(inventory[0]));
     const auto finish_vertices = [&] {
-        const auto v = PrepareVertices(vertices, candidates, cache, profile, library, update);
+        const auto v = PrepareVertices(vertices, cache, profile, library, update);
         result.supported += v.supported;
         result.prepared_entries += v.prepared_entries;
         result.distinct_programs += v.distinct_programs;
@@ -674,7 +814,7 @@ Summary Prepare(const fs::path& dump, const fs::path& cache, const Profile& prof
                     info.sw_stage = SwStage::Fragment;
                     info.pgm_hash = hash;
                     info.pgm_base = 0;
-                    AssetInputs inputs(c.usages, 0, true);
+                    AssetInputs inputs(c.usages, 0, true, c.code);
                     info.offline_memory = &inputs;
                     info.user_data = inputs.UserData().first(runtime.props.num_user_data);
                     info.offline_descriptor_snapshot = true;
@@ -726,8 +866,8 @@ bool TryLoadAt(const fs::path& cache, Info& info, const RuntimeInfo& runtime,
     Header header;
     try {
         const auto code_hash = XXH3_64bits(code.data(), code.size_bytes());
-        if (vertex) return TryTemplate(cache / "vertex", RuntimeKey(runtime, start), code_hash,
-                                      info, runtime, profile, spirv, captured_fetch);
+        if (vertex) return TryTemplate(cache / "vertex", RuntimeKey(runtime), code_hash,
+                                      info, runtime, profile, spirv, captured_fetch, start);
         if (!Read(cache, info.pgm_hash, code_hash, runtime, profile, spirv, header))
             return TryTemplate(cache, RuntimeKey(runtime), code_hash, info, runtime, profile, spirv);
     } catch (const std::exception&) {

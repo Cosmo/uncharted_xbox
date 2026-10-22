@@ -116,6 +116,15 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
                     inst.opcode <= Gcn::Opcode::S_CBRANCH_EXECNZ) {
                     line += " -> " + std::to_string(s64(pc) + 4 + s64(inst.control.sopp.simm) * 4);
                 }
+                if (inst.inst_class == Gcn::InstClass::ScalarMemRd) {
+                    // Scalar loads: base register pair and dword offset (or offset register)
+                    line += " pair s" + std::to_string(inst.src[0].code * 2) +
+                            (inst.control.smrd.imm ? " +" : " +s") +
+                            std::to_string(inst.control.smrd.offset == 0xff && !inst.control.smrd.imm
+                                               ? inst.src[1].code
+                                               : inst.control.smrd.offset) +
+                            " x" + std::to_string(inst.control.smrd.count);
+                }
                 std::fprintf(f, "%s\n", line.c_str());
                 pc += inst.length;
             }

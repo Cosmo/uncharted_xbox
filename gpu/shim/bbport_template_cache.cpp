@@ -121,6 +121,14 @@ bool Compatible(const Info& baseline, const Info& current, const RuntimeInfo& ru
             if (sharp.GetStride() & 3) return false;
             actual.buffers[i].stride = expected.buffers[i].stride;
             if (!desc.is_written) actual.buffers[i].dst_select = expected.buffers[i].dst_select;
+            // Formatted reads take the descriptor's format when frozen (OfflineSlot::BufferFormat).
+            if (!desc.is_written && desc.is_formatted &&
+                sharp.GetNumberConversion() == AmdGpu::NumberConversion::None &&
+                TemplateBufferFormat(sharp.GetDataFmt(), sharp.GetNumberFmt())) {
+                actual.buffers[i].data_format = expected.buffers[i].data_format;
+                actual.buffers[i].num_format = expected.buffers[i].num_format;
+                actual.buffers[i].num_conversion = expected.buffers[i].num_conversion;
+            }
             if (desc.is_written && sharp.mtype != desc.GetSharp(baseline).mtype)
                 return false;
         }
@@ -268,24 +276,9 @@ bool TemplatesReady(const fs::path& cache, const Profile& profile, u64 library, 
     entries = index->header.count;
     return true;
 }
-std::vector<Backend::Bindings> TemplateBindingVariants(const fs::path& cache, u64 hash,
-                                                       u64 code_hash, const Profile& profile) {
-    std::vector<Backend::Bindings> result;
-    const auto index = ReadIndex(cache, profile);
-    if (!index) return result;
-    const auto [first, last] = index->entries.equal_range(hash);
-    for (auto it = first; it != last; ++it) {
-        const auto& e = it->second;
-        if (e.code_hash != code_hash) continue;
-        Backend::Bindings b{e.reserved & 255, (e.reserved >> 8) & 255, (e.reserved >> 16) & 255};
-        if (std::ranges::find_if(result, [&](const auto& value) { return value == b; }) == result.end())
-            result.push_back(b);
-    }
-    return result;
-}
 bool TryTemplate(const fs::path& cache, u64 runtime_key, u64 code_hash, Info& info,
                  const RuntimeInfo& runtime, const Profile& profile, std::vector<u32>& spirv,
-                 const Gcn::FetchShaderSnapshot* captured_fetch) {
+                 const Gcn::FetchShaderSnapshot* captured_fetch, Backend::Bindings start) {
     try {
         const auto index = ReadIndex(cache, profile);
         if (!index)
@@ -371,9 +364,28 @@ bool TryTemplate(const fs::path& cache, u64 runtime_key, u64 code_hash, Info& in
             if (!Compatible(baseline, prepared, runtime, profile, baseline_fetch))
                 continue;
             std::vector<u32> resolved;
-            if (!FreezeTemplate(
-                    compiled, [&](u32 slot) { return DescriptorConstant(slot, prepared); },
-                    resolved))
+            // Templates are prepared at binding start 0 and moved to the stage's start here.
+            const auto resolve = [&](u32 slot) -> std::optional<u32> {
+                if (slot >= OfflineSlot::BufferBinding && slot < OfflineSlot::BufferBinding + 4 * 64) {
+                    const u32 buffer = start.buffer + (slot - OfflineSlot::BufferBinding) / 4;
+                    switch ((slot - OfflineSlot::BufferBinding) % 4) {
+                    case 0:
+                        return PushData::BufOffsetIndex + (buffer >> 4);
+                    case 1:
+                        return (buffer & 0xf) >> 2;
+                    case 2:
+                        return (buffer & 0x3) << 3;
+                    }
+                    return std::nullopt;
+                }
+                if (slot >= OfflineSlot::UserData && slot < OfflineSlot::UserData + 2 * 64) {
+                    const u32 index = start.user_data + (slot - OfflineSlot::UserData) / 2;
+                    return (slot - OfflineSlot::UserData) % 2 ? index & 3
+                                                              : PushData::UdRegsIndex + (index >> 2);
+                }
+                return DescriptorConstant(slot, prepared);
+            };
+            if (!FreezeTemplate(compiled, resolve, resolved, start.unified))
                 continue;
             info = std::move(prepared);
             spirv = std::move(resolved);

@@ -27,10 +27,9 @@ class TemplateWriter {
 };
 bool TemplatesReady(const std::filesystem::path& cache, const Shader::Profile& profile, u64 library,
                     u32& entries);
-std::vector<Shader::Backend::Bindings> TemplateBindingVariants(const std::filesystem::path& cache,
-    u64 hash, u64 code_hash, const Shader::Profile& profile);
 bool TryTemplate(const std::filesystem::path& cache, u64 runtime_key, u64 code_hash,
                  Shader::Info& info, const Shader::RuntimeInfo& runtime,
                  const Shader::Profile& profile, std::vector<u32>& spirv,
-                 const Shader::Gcn::FetchShaderSnapshot* captured_fetch = nullptr);
+                 const Shader::Gcn::FetchShaderSnapshot* captured_fetch = nullptr,
+                 Shader::Backend::Bindings start = {});
 } // namespace BbPrecompile

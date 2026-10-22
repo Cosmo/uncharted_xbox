@@ -831,18 +831,24 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 
     // bbport: shaders prepared ahead of the game (start menu, BbPrecompile) skip the translation.
     std::vector<u32> spv;
-    static std::atomic<u32> prepared_hits{0}, translated{0};
+    static std::atomic<u32> prepared_hits{0}, translated{0}, pixel_hits{0}, pixel_translated{0};
+    const bool pixel = info.hw_stage == Shader::HwStage::Fragment;
     if (BbPrecompile::TryLoad(info, runtime_info, code, profile, spv, binding)) {
         prepared_hits.fetch_add(1, std::memory_order_relaxed);
+        if (pixel)
+            pixel_hits.fetch_add(1, std::memory_order_relaxed);
         info.AddBindings(binding);
     } else {
         translated.fetch_add(1, std::memory_order_relaxed);
+        if (pixel)
+            pixel_translated.fetch_add(1, std::memory_order_relaxed);
         const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
         spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     }
     if (const u32 total = prepared_hits + translated; total % 50 == 0) {
-        std::printf("Shaders: %u prepared ahead, %u translated during play\n", prepared_hits.load(),
-                    translated.load());
+        std::printf("Shaders: %u prepared ahead, %u translated during play (pixel %u of %u)\n",
+                    prepared_hits.load(), translated.load(), pixel_hits.load(),
+                    pixel_hits.load() + pixel_translated.load());
     }
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 

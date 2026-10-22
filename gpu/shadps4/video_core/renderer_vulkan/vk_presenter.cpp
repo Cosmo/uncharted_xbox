@@ -250,7 +250,8 @@ void Presenter::RunStartMenu() {
     const std::string game = game_env && *game_env ? game_env : "u1";
     const std::filesystem::path data = std::filesystem::path(dump) / (game + "data");
     const auto cache = BbPrecompile::CacheDirectory();
-    const auto marker = cache / "prepared.txt";
+    // Versioned so that a build which prepares more shaders prepares again (2: resource tables).
+    const auto marker = cache / "prepared-2.txt";
     std::string status;
     const auto precompile = [&] {
         try {
