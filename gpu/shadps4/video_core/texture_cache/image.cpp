@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "bbport_toggles.h"
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <ranges>
@@ -19,6 +20,9 @@
 extern "C" uint64_t uncharted_uwp_app_memory_usage();
 extern "C" uint64_t uncharted_uwp_app_memory_limit();
 extern "C" uint64_t runtime_memory_page_out(uint64_t bytes);
+namespace UnchartedUwp::Overlay {
+void DumpAllocations(VmaAllocator allocator, const char* reason); // overlay.cpp
+}
 #endif
 
 namespace VideoCore {
@@ -149,6 +153,10 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
                             budget.statistics.allocationBytes >> 20,
                             budget.statistics.blockBytes >> 20);
             }
+        }
+        static std::atomic<bool> dumped{false};
+        if (!dumped.exchange(true)) {
+            UnchartedUwp::Overlay::DumpAllocations(allocator, "image allocation failed");
         }
     }
 #endif

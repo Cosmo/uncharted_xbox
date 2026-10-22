@@ -11,6 +11,7 @@ extern "C" void runtime_memory_resident(uint64_t* private_bytes, uint64_t* share
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <string>
 #include <cstdlib>
 #include <thread>
 
@@ -28,6 +29,20 @@ bool MetricsOn() {
 }
 }
 bool Visible() { return MetricsOn(); }
+// Every Vulkan Memory Allocator allocation (type, size, usage) as VMA's JSON, to BB_VMA_DUMP (LocalState\vma.json):
+// at the first allocation failure, and while the metrics run when LocalState\vma.txt exists (removed after).
+void DumpAllocations(VmaAllocator allocator,const char* reason) {
+    const char* path=std::getenv("BB_VMA_DUMP");
+    if(!path||!*path) return;
+    char* json=nullptr;
+    vmaBuildStatsString(allocator,&json,VK_TRUE);
+    if(FILE* file=std::fopen(path,"wb")) {
+        std::fputs(json,file);
+        std::fclose(file);
+        std::printf("Vulkan allocations (%s) written to %s\n",reason,path);
+    }
+    vmaFreeStatsString(allocator,json);
+}
 void Presented() {
     const auto now=Clock::now();
     if(last_frame!=Clock::time_point{}) {
@@ -83,5 +98,13 @@ void Render(const Vulkan::Instance& instance) {
         guest_private>>20,guest_shared>>20,guest_saved>>20);
     reported=now;
     runtime_file_profile_report();
+    if(const char* path=std::getenv("BB_VMA_DUMP");path&&*path) {
+        std::string trigger(path);
+        trigger.replace(trigger.size()-4,4,"txt");
+        if(GetFileAttributesA(trigger.c_str())!=INVALID_FILE_ATTRIBUTES) {
+            DeleteFileA(trigger.c_str());
+            DumpAllocations(instance.GetAllocator(),"requested");
+        }
+    }
 }
 }

@@ -641,6 +641,7 @@ static void loader() {
     std::string content=prepared+"\\content.bin";
     _putenv_s("BB_CONFIG",(user+"\\graphics.cfg").c_str());
     _putenv_s("BB_PAD_FILE",(winrt::to_string(local)+"\\controls.txt").c_str());
+    _putenv_s("BB_VMA_DUMP",(winrt::to_string(local)+"\\vma.json").c_str());  // overlay.cpp: Vulkan allocations
     _putenv_s("BB_CAPTURE_TRIGGER",(winrt::to_string(local)+"\\capture.txt").c_str());
     _putenv_s("BB_TOGGLE_FILE",(winrt::to_string(local)+"\\toggles.txt").c_str());
     _putenv_s("BB_UPSCALER","off");
