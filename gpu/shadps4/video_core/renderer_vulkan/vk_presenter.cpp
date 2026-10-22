@@ -242,7 +242,8 @@ void Presenter::PresentLoadingFrame() {
 void Presenter::RunStartMenu() {
     const char* launcher = std::getenv("BB_UWP_LAUNCHER");
     const char* dump = std::getenv("BB_PRECOMPILE_DUMP");
-    if (!launcher || *launcher != '1' || !dump || !*dump) {
+    // Without prepared shaders (BB_PRECOMPILE=0) there is nothing to prepare: straight into the game.
+    if (!launcher || *launcher != '1' || !dump || !*dump || !BbPrecompile::Enabled()) {
         return;
     }
     // The game's data folder (u1data, u2data, u3data) and its prepared shader library.

@@ -852,8 +852,17 @@ Summary Prepare(const fs::path& dump, const fs::path& cache, const Profile& prof
                 result.skipped, result.failed);
     return result;
 }
+bool Enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_PRECOMPILE");
+        return !(value && value[0] == '0');
+    }();
+    return enabled;
+}
 bool TryLoad(Info& info, const RuntimeInfo& runtime, std::span<const u32> code,
              const Profile& profile, std::vector<u32>& spirv, Backend::Bindings start) {
+    if (!Enabled())
+        return false;
     return TryLoadAt(CacheDirectory(), info, runtime, code, profile, spirv, start);
 }
 bool TryLoadAt(const fs::path& cache, Info& info, const RuntimeInfo& runtime,

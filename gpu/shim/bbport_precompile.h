@@ -19,6 +19,8 @@ struct Summary {
     u32 compiled = 0, already_cached = 0, failed = 0, archives = 0;
 };
 using Update = std::function<void(const Progress&)>;
+/// BB_PRECOMPILE=0: prepared shaders are neither made nor used; every shader is translated.
+bool Enabled();
 std::filesystem::path CacheDirectory();
 Summary Prepare(const std::filesystem::path& dump, const std::filesystem::path& cache,
                 const Shader::Profile& profile, const Update& update);

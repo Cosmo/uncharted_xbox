@@ -524,7 +524,7 @@ static void loader() {
            key=="BB_RECORDER_TIMINGS"||key=="BB_BAKED_PIPELINES"||
            key=="BB_PERF_DIAG"||key=="BB_PREP_WORKERS"||key=="BB_COPY_THREADS"||key=="BB_CHOOSE_DUMP"||
            key=="BB_READ_FAULT_EVERY"||key=="BB_RENDER_720P"||key=="BB_DRED"||key=="BB_GPU_CHECKPOINTS"||key=="BB_SKIP_SHADERS"||key=="BB_GPU_CHECKPOINTS_FROM"||key=="BB_DUMP_GCN"||
-           key=="BB_FRAME_DUMP_TRIGGER"||key=="BB_DUMP_DIR"||key=="BB_START_MENU") {
+           key=="BB_FRAME_DUMP_TRIGGER"||key=="BB_DUMP_DIR"||key=="BB_START_MENU"||key=="BB_PRECOMPILE") {
             _putenv_s(key.c_str(),value.c_str());
             SetEnvironmentVariableW(winrt::to_hstring(key).c_str(),winrt::to_hstring(value).c_str());
         }
@@ -657,9 +657,11 @@ static void loader() {
     if(!std::getenv("BB_PREP_WORKERS")) _putenv_s("BB_PREP_WORKERS","0");
     // Finish saved-pipeline loading before play; reserve background compilation for new effects.
     // Compiler concurrency and retained IR pools are bounded separately in the UWP renderer.
+    // Prepared shaders are off while the game crash seen with them (a guest read of a garbage
+    // pointer) is found; BB_PRECOMPILE=1 (graphics-debug.txt) turns them on.
     const std::pair<const char*,const char*> performance_defaults[]={
         {"BB_PIPELINE_CACHE","1"},{"BB_BACKGROUND_WARMUP","0"},{"BB_PARALLEL_WARMUP","1"},
-        {"BB_PIPELINE_BINARIES","1"},{"BB_STREAM_MEMORY","cached"}
+        {"BB_PIPELINE_BINARIES","1"},{"BB_STREAM_MEMORY","cached"},{"BB_PRECOMPILE","0"}
     };
     for(auto [key,value]:performance_defaults) if(!std::getenv(key)) _putenv_s(key,value);
     // The in-game menu's settings, as upstream's launcher reads them before a start: the settings the renderer
