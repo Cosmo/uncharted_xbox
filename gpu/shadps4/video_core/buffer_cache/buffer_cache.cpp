@@ -1341,6 +1341,9 @@ void BufferCache::DumpArenas() const {
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+#ifdef UNCHARTED_UWP
+    ReleaseRetiredArenas();
+#endif
     if (pending_binds.empty()) {
         return;
     }

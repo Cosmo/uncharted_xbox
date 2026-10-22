@@ -6,6 +6,7 @@
 #include "bbport_copy.h"
 
 #include <deque>
+#include <list>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -171,6 +172,13 @@ private:
     std::array<DenseView,DmaViewCount> dense_views{};
     std::unordered_map<u64,u32> dense_slots;
     std::unique_ptr<Buffer> null_buffer;
+    /// The arenas (whole buffers: no sparse binding). One that a larger arena replaced is freed
+    /// once the GPU finished the submissions that could still use it (ReleaseRetiredArenas).
+    std::list<Buffer> dense_arenas;
+    struct RetiredArena {std::list<Buffer>::iterator arena; u64 tick;};
+    std::vector<RetiredArena> retired_arenas;
+    std::mutex dense_arena_mutex;
+    void ReleaseRetiredArenas();
 #endif
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);

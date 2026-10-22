@@ -47,11 +47,23 @@ const Buffer* BufferCache::GetDenseArena(u64 first_block,u64 last_block) {
             first_page=std::min(first_page,old_first);last_page=std::max(last_page,old_last);
         }
     } while(expanded);
-    auto arena=&arenas.emplace_back(instance,first_page<<arena_page_bits,
-        (last_page-first_page+1)<<arena_page_bits,MemoryType::DeviceLocal);
+    Buffer* arena;
+    {
+        std::scoped_lock lk{dense_arena_mutex};
+        arena=&dense_arenas.emplace_back(instance,first_page<<arena_page_bits,
+            (last_page-first_page+1)<<arena_page_bits,MemoryType::DeviceLocal);
+    }
     for(auto old:previous) {
         const vk::BufferCopy copy{0,old->cpu_addr-arena->cpu_addr,old->size_bytes};
         runtime.CopyBuffer(old,arena,std::span{&copy,1});
+    }
+    // The replaced arenas held whole copies of their ranges (448 of 1200 MiB in Uncharted 1's first
+    // level, on the Xbox's 5 GiB): they go once nothing can use them any more.
+    if(!previous.empty()) {
+        std::scoped_lock lk{dense_arena_mutex};
+        const u64 tick=scheduler.CurrentTick();
+        for(auto it=dense_arenas.begin();it!=dense_arenas.end();++it)
+            if(previous.contains(&*it)) retired_arenas.push_back({it,tick});
     }
     for(u64 page=first_page;page<=last_page;++page) {
         address_space[page]=arena;
@@ -61,6 +73,18 @@ const Buffer* BufferCache::GetDenseArena(u64 first_block,u64 last_block) {
     }
     std::printf("UWP dense GPU arena: %#llx, %llu MiB, %zu live DMA views\n",arena->cpu_addr,arena->size_bytes>>20,dense_slots.size());
     return arena;
+}
+void BufferCache::ReleaseRetiredArenas() {
+    // Commands recorded shortly after the replacement may still name the old arena (prepared
+    // draws): it goes when the GPU has finished RetireTicks submissions beyond that point.
+    constexpr u64 RetireTicks=64;
+    std::scoped_lock lk{dense_arena_mutex};
+    std::erase_if(retired_arenas,[&](const RetiredArena& retired) {
+        if(!scheduler.IsFree(retired.tick+RetireTicks)) return false;
+        std::printf("UWP dense GPU arena: %#llx, %llu MiB released\n",retired.arena->cpu_addr,retired.arena->size_bytes>>20);
+        dense_arenas.erase(retired.arena);
+        return true;
+    });
 }
 void BufferCache::EnsureDenseResident(const Buffer* arena,u64 first_block,u64 last_block) {
     IntervalList gaps;
