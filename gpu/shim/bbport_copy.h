@@ -53,4 +53,9 @@ bool InCopyThread();
 void SetDeferredPoster(void (*post)());
 void RunDeferred();
 
+/// Whether the calling thread is GPU-side (handles faults on GPU-written memory inline; set by the
+/// rasterizer). Other threads that wait for copies (the presenter) and help run them do so under
+/// the recovery point too, and leave stopped copies to a GPU-side thread.
+void SetGpuSideCheck(bool (*check)());
+
 } // namespace BbCopy

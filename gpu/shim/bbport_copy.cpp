@@ -21,8 +21,17 @@ namespace BbCopy {
 namespace {
 
 thread_local bool in_copy_thread = false;
+/// Tasks this thread is running (RunAsync): a fault inside one can wait for copies again
+/// (GPU-side threads read GPU-written memory back inline and submit, which waits for copies).
+thread_local std::size_t running_here = 0;
 /// SetDeferredPoster: asks the GPU command thread to call RunDeferred().
 std::atomic<void (*)()> deferred_poster{nullptr};
+/// SetGpuSideCheck: true on threads that handle faults on GPU-written memory inline.
+std::atomic<bool (*)()> gpu_side_check{nullptr};
+bool GpuSideThread() {
+    const auto check = gpu_side_check.load(std::memory_order_acquire);
+    return !check || check();
+}
 
 /// Runs `work` under a recovery point: on a copy thread, a read of guest memory the GPU wrote jumps
 /// back here (page_manager.cpp declines the fault) instead of waiting for the GPU thread, which may
@@ -95,7 +104,11 @@ public:
     }
 
     void WaitAll() {
-        // The waiting thread helps instead of only spinning.
+        // The waiting thread helps instead of only spinning. One that is not GPU-side (the
+        // presenter) would wait for the GPU thread at a fault on GPU-written memory, which may be
+        // waiting for these copies (a hang in play, Uncharted 1 on the Series X): it runs tasks
+        // under the recovery point like a copy thread and leaves stopped ones to a GPU-side thread.
+        const bool gpu_side = GpuSideThread();
         while (true) {
             Task task;
             {
@@ -103,8 +116,14 @@ public:
                 if (pending == 0 && epochs.size() == 1 && !draining) {
                     return;
                 }
+                // Inside a task of this thread (a deferred copy that faulted again on the GPU
+                // command thread, which then submits): that task cannot finish while this waits,
+                // so only the others count. Waiting for itself hung the game (Series X).
+                if (running_here != 0 && pending <= running_here) {
+                    return;
+                }
                 // Tasks a copy thread stopped at a fault first: only a GPU-side thread finishes them.
-                if (!deferred.empty()) {
+                if (gpu_side && !deferred.empty()) {
                     task = std::move(deferred.front());
                     deferred.pop_front();
                 } else if (!async_tasks.empty()) {
@@ -113,7 +132,7 @@ public:
                 }
             }
             if (task.run) {
-                RunAsync(task);
+                RunAsync(task, !gpu_side);
             } else {
                 std::this_thread::yield();
             }
@@ -187,12 +206,14 @@ private:
     void RunAsync(Task& task, bool recoverable = false) {
         const bool was = in_copy_thread;
         in_copy_thread = true;
+        ++running_here;
         bool finished = true;
         if (recoverable) {
             finished = RunRecoverable(task.run);
         } else {
             task.run();
         }
+        --running_here;
         in_copy_thread = was;
         if (!finished) {
             Defer(std::move(task));
@@ -335,6 +356,10 @@ void RunDeferred() {
     GetPool().RunDeferred();
 }
 
+void SetGpuSideCheck(bool (*check)()) {
+    gpu_side_check.store(check, std::memory_order_release);
+}
+
 bool Enabled() {
     return GetPool().Enabled() && !BbToggle::Disabled(BbToggle::ParallelCopies);
 }
@@ -381,7 +406,11 @@ void AfterCopies(std::function<void()> callback) {
 }
 
 void WaitAsync() {
-    // The caller's own batch runs here: handing it over only to wait for it costs a wakeup.
+    // The caller's own batch runs here: handing it over only to wait for it costs a wakeup. A
+    // thread that is not GPU-side hands it over, so it runs under a recovery point (WaitAll).
+    if (!batch.items.empty() && Enabled() && !GpuSideThread()) {
+        FlushBatch();
+    }
     if (!batch.items.empty()) {
         for (const auto& item : batch.items) {
             item.run(item);

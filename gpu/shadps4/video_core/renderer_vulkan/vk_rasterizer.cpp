@@ -6,6 +6,7 @@
 #include "core/libraries/videoout/driver.h"
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
+#include "bbport_copy.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
@@ -320,6 +321,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     static Rasterizer* busy_check;
     busy_check = this;
     g_draw_pipe_busy = [] { return busy_check->OnStageA() && !busy_check->DrawPipeIdle(); };
+    // bbport: threads waiting for copies that are not GPU-side run them under a recovery point.
+    BbCopy::SetGpuSideCheck([] { return busy_check->IsGpuSideThread(); });
 }
 
 Rasterizer::~Rasterizer() = default;
