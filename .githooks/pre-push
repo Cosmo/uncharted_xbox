@@ -1,0 +1,3 @@
+#!/bin/sh
+# Every commit a push sends, also ones made with --no-verify or by other tools (tools/leak_check.py).
+exec "$(git rev-parse --show-toplevel)/.githooks/leak-check" pre-push "$@"

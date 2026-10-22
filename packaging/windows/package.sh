@@ -85,6 +85,12 @@ mkdir -p dist
 rm -f dist/uncharted-windows.zip
 (cd out/stage && powershell -NoProfile -Command \
     "Compress-Archive -Path uncharted-windows -DestinationPath ../../dist/uncharted-windows.zip")
+# No game files, saves or paths of this machine in the zip (tools/leak_check.py). Executables keep
+# this checkout's path in their __FILE__ strings unless built with -ffile-prefix-map.
+if ! "$python" tools/leak_check.py package dist/uncharted-windows.zip; then
+    rm -f dist/uncharted-windows.zip
+    exit 1
+fi
 
 # Refresh dist/uncharted-windows, keeping what players create there (saves, settings), and only
 # while nothing runs from it: deleting a running launcher's files breaks it.

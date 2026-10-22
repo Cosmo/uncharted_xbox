@@ -1,0 +1,3 @@
+#!/bin/sh
+# No paths of this machine or credentials in a commit message (tools/leak_check.py).
+exec "$(git rev-parse --show-toplevel)/.githooks/leak-check" message "$1"

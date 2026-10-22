@@ -1,0 +1,23 @@
+# The commits of this fork (those no upstream has) carry no game files, paths of a developer's machine
+# or credentials: the same check as the hooks in .githooks, which a --no-verify commit skips.
+name: Leak check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  leak-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Commits that are not upstream's
+        run: |
+          git fetch --no-tags --quiet https://github.com/Supermedo/uncharted_pc.git +main:refs/upstream/supermedo
+          git fetch --no-tags --quiet https://github.com/currantsforeyes/uncharted_pc.git +main:refs/upstream/currantsforeyes
+          python3 tools/leak_check.py commits HEAD --not refs/upstream/supermedo refs/upstream/currantsforeyes

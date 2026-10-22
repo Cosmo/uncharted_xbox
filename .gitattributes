@@ -1,0 +1,2 @@
+# The hooks run in sh, which would read a CR at a line end as part of the command.
+.githooks/* text eol=lf

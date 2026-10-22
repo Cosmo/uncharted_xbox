@@ -1,0 +1,11 @@
+#!/bin/sh
+# Runs tools/leak_check.py with the first Python 3.8+ found (on Windows python3 can be a Store stub).
+# The hooks here call it; enable them once per clone: git config core.hooksPath .githooks
+root=$(git rev-parse --show-toplevel) || exit 2
+for python in python3 python py; do
+    if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
+        exec "$python" "$root/tools/leak_check.py" "$@"
+    fi
+done
+echo 'leak-check: no Python 3.8 or newer found, so nothing was checked and git stops here.' >&2
+exit 2
