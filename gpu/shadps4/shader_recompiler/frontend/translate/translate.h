@@ -402,6 +402,8 @@ private:
     std::optional<FetchShaderData> fetch_data{};
     bool opcode_missing = false;
     u32 pc{};
+    /// UWP: the next V_READFIRSTLANE_B32 starts a waterfall loop of a pixel shader (see Translate).
+    bool waterfall_lane_value = false;
 };
 
 } // namespace Shader::Gcn

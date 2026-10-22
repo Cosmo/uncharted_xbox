@@ -13,7 +13,11 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
+#ifdef UNCHARTED_UWP
+static constexpr u32 ShaderBinaryVersion = 10u; // UWP: pixel shader waterfall loops (translate.cpp)
+#else
 static constexpr u32 ShaderBinaryVersion = 9u; // bbport: addr64 buffer loads (ReadConst windows)
+#endif
 static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
 static constexpr u32 PipelineKeyVersion = 6u; // bbport: GraphicsPipelineKey::baked (Dozen's static state)
 } // namespace Serialization

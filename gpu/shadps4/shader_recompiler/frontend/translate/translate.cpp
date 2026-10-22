@@ -1220,8 +1220,29 @@ void Translator::Translate(IR::Block* block, u32 start_pc, IR::Condition cond,
     }
     ir = IR::IREmitter{*block, block->begin()};
     pc = start_pc;
-    for (const auto& inst : inst_list) {
+    for (size_t index = 0; index < inst_list.size(); ++index) {
+        const auto& inst = inst_list[index];
         pc += inst.length;
+#ifdef UNCHARTED_UWP
+        // A pixel shader's waterfall loop: v_readfirstlane sX, vY, then v_cmpx_eq sX, vY keeps the
+        // lanes holding that value, which do the work, and the loop repeats for the others. On
+        // Dozen (D3D12) the helper lanes that whole-quad mode adds take part in the comparison
+        // but not reliably in the wave operations, so one could stay in the loop forever and the
+        // GPU hung (Uncharted 1's dive boat, fragment shader b4fa3a82). Each lane reads its own
+        // value instead: every lane is matched in the first pass, with the same result.
+        if (inst.opcode == Opcode::V_READFIRSTLANE_B32 && info.hw_stage == HwStage::Fragment) {
+            for (size_t next = index + 1; next < inst_list.size() && next <= index + 4; ++next) {
+                const auto& cmp = inst_list[next];
+                if ((cmp.opcode == Opcode::V_CMPX_EQ_U32 || cmp.opcode == Opcode::V_CMPX_EQ_I32) &&
+                    cmp.src_count >= 2 && cmp.src[0].field == inst.dst[0].field &&
+                    cmp.src[0].code == inst.dst[0].code && cmp.src[1].field == inst.src[0].field &&
+                    cmp.src[1].code == inst.src[0].code) {
+                    waterfall_lane_value = true;
+                    break;
+                }
+            }
+        }
+#endif
 
         // Special case for emitting fetch shader.
         if (inst.opcode == Opcode::S_SWAPPC_B64) {

@@ -99,6 +99,12 @@ void Translator::EmitDataShare(const GcnInst& inst) {
 
 void Translator::V_READFIRSTLANE_B32(const GcnInst& inst) {
     const IR::U32 value{GetSrc(inst.src[0])};
+    if (waterfall_lane_value) {
+        // UWP: a pixel shader's waterfall loop (Translate): the lane's own value.
+        waterfall_lane_value = false;
+        SetDst(inst.dst[0], value);
+        return;
+    }
     SetDst(inst.dst[0], ir.ReadFirstLane(value));
 }
 
