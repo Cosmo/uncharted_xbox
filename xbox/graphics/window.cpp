@@ -47,14 +47,16 @@ bool WindowSDL::PollEvents() {
         event.gbutton.button=host;
         BbOverlay::HandleEvent(event);
     };
-    // R3 + left trigger opens and closes the menu, so both always reach it.
-    if(changed&0x100) {
-        SDL_Event event{}; event.type=SDL_EVENT_GAMEPAD_AXIS_MOTION;
-        event.gaxis.axis=SDL_GAMEPAD_AXIS_LEFT_TRIGGER;
-        event.gaxis.value=buttons&0x100 ? SDL_JOYSTICK_AXIS_MAX : 0;
+    // View + Menu opens and closes the menu (as in KytyPS5), when both are released: the order of
+    // the presses doesn't matter, and the game gets neither (input.cpp).
+    static thread_local bool chord=false;
+    constexpr uint32_t chord_buttons=UNCHARTED_UWP_VIEW|0x8;
+    if((buttons&chord_buttons)==chord_buttons) chord=true;
+    if(chord&&!(buttons&chord_buttons)) {
+        chord=false;
+        SDL_Event event{}; event.type=SDL_EVENT_KEY_DOWN; event.key.key=SDLK_INSERT;
         BbOverlay::HandleEvent(event);
     }
-    if(changed&4) send(4,SDL_GAMEPAD_BUTTON_RIGHT_STICK);
     if(BbOverlay::CapturesInput()) {
         struct Mapping {uint32_t guest;Uint8 host;};
         constexpr Mapping map[]={
@@ -63,7 +65,7 @@ bool WindowSDL::PollEvents() {
             {0x10,SDL_GAMEPAD_BUTTON_DPAD_UP},{0x40,SDL_GAMEPAD_BUTTON_DPAD_DOWN},
             {0x80,SDL_GAMEPAD_BUTTON_DPAD_LEFT},{0x20,SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
             {0x400,SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},{0x800,SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
-            {0x8,SDL_GAMEPAD_BUTTON_START},{0x80000000u,SDL_GAMEPAD_BUTTON_BACK}};
+            {0x8,SDL_GAMEPAD_BUTTON_START},{UNCHARTED_UWP_VIEW,SDL_GAMEPAD_BUTTON_BACK}};
         for(auto const& entry:map) if(changed&entry.guest) {
             send(entry.guest,entry.host);
             // One press closes at most one modal dialog.

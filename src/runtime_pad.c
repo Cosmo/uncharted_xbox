@@ -528,9 +528,12 @@ static void sample_host(PadData *d) {
     d->timestamp=now_us();
 #ifdef UNCHARTED_UWP
     uint8_t axes[6]={128,128,128,128,0,0};
-    d->connected=uncharted_uwp_gamepad(&d->buttons,axes);
+    float touch[2];
+    d->connected=uncharted_uwp_gamepad(&d->buttons,axes,touch);
     d->left_x=axes[0]; d->left_y=axes[1]; d->right_x=axes[2]; d->right_y=axes[3];
     d->l2=axes[4]; d->r2=axes[5];
+    if (touch[0]>=0.0f)  /* View + left stick */
+        d->touches[d->touch_count++]=(PadTouch){.x=touch_axis(touch[0],1919),.y=touch_axis(touch[1],942),.id=0};
     return;
 #endif
     static int loaded;
@@ -858,7 +861,7 @@ static ABI int32_t pad_info(int32_t handle, ControllerInfo *info) {
     pthread_mutex_lock(&lock);
 #ifdef UNCHARTED_UWP
     uint32_t buttons=0; uint8_t axes[6];
-    info->connected=uncharted_uwp_gamepad(&buttons,axes);
+    info->connected=uncharted_uwp_gamepad(&buttons,axes,NULL);
     read_inject();
     if (injection_available || replay_armed) info->connected=1;
 #else
