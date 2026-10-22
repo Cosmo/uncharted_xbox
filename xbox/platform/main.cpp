@@ -523,7 +523,8 @@ static void loader() {
            key=="BB_PIPELINE_BINARIES"||key=="BB_FRAMES_AHEAD"||key=="BB_STREAM_MEMORY"||
            key=="BB_RECORDER_TIMINGS"||key=="BB_BAKED_PIPELINES"||
            key=="BB_PERF_DIAG"||key=="BB_PREP_WORKERS"||key=="BB_COPY_THREADS"||key=="BB_CHOOSE_DUMP"||
-           key=="BB_READ_FAULT_EVERY"||key=="BB_RENDER_720P"||key=="BB_DRED"||key=="BB_GPU_CHECKPOINTS"||key=="BB_SKIP_SHADERS"||key=="BB_GPU_CHECKPOINTS_FROM"||key=="BB_DUMP_GCN") {
+           key=="BB_READ_FAULT_EVERY"||key=="BB_RENDER_720P"||key=="BB_DRED"||key=="BB_GPU_CHECKPOINTS"||key=="BB_SKIP_SHADERS"||key=="BB_GPU_CHECKPOINTS_FROM"||key=="BB_DUMP_GCN"||
+           key=="BB_FRAME_DUMP_TRIGGER"||key=="BB_DUMP_DIR") {
             _putenv_s(key.c_str(),value.c_str());
             SetEnvironmentVariableW(winrt::to_hstring(key).c_str(),winrt::to_hstring(value).c_str());
         }

@@ -467,6 +467,47 @@ GraphicsPipeline::GraphicsPipeline(
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
 #ifdef UNCHARTED_UWP
+    // Uncharted's camera velocity pass for the motion blur (fragment shader f4b18264,
+    // BB_ZERO_REFUSED_PS): Dozen cannot compile it for the Series X (shader model 6.4). Without it
+    // the blur read stale velocities and smeared the picture. Refused, it writes zero velocity
+    // instead: no motion blur. Its targets are float formats.
+    vk::UniqueShaderModule zero_module;
+    if (pipeline_result != vk::Result::eSuccess && infos[u32(Shader::SwStage::Fragment)]) {
+        static const std::vector<u64> zero_hashes = [] {
+            std::vector<u64> list;
+            const char* env = std::getenv("BB_ZERO_REFUSED_PS");
+            for (const char* p = env ? env : "f4b18264"; *p;) {
+                char* end;
+                const u64 value = std::strtoull(p, &end, 16);
+                if (end == p) break;
+                list.push_back(value);
+                p = *end == ',' ? end + 1 : end;
+            }
+            return list;
+        }();
+        const u64 fs_hash = infos[u32(Shader::SwStage::Fragment)]->pgm_hash;
+        if (std::ranges::find(zero_hashes, fs_hash) != zero_hashes.end()) {
+            const auto spv = Shader::Backend::SPIRV::EmitZeroFragmentShader(key.num_color_attachments);
+            auto [module_result, module] = device.createShaderModuleUnique(
+                {.codeSize = spv.size() * sizeof(u32), .pCode = spv.data()});
+            if (module_result == vk::Result::eSuccess) {
+                zero_module = std::move(module);
+                for (auto& stage_info : shader_stages) {
+                    if (stage_info.stage == vk::ShaderStageFlagBits::eFragment) {
+                        stage_info.module = *zero_module;
+                    }
+                }
+                auto [zero_result, zero_pipe] =
+                    device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+                if (zero_result == vk::Result::eSuccess) {
+                    std::fprintf(stderr, "UWP pipeline %s: refused; writes zero instead\n",
+                                 debug_str.c_str());
+                    pipeline_result = zero_result;
+                    pipe = std::move(zero_pipe);
+                }
+            }
+        }
+    }
     // Dozen refuses some pipelines (a shader it cannot translate to DXIL, a state D3D12 rejects) and
     // reports both as out of memory. The game goes on without their draws; the log says which.
     if (pipeline_result != vk::Result::eSuccess) {

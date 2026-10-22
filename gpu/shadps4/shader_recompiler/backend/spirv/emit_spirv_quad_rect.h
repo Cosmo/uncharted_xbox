@@ -23,4 +23,7 @@ enum class AuxShaderType : u32 {
 [[nodiscard]] std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type,
                                                       const HwFragmentRuntimeInfo& fs_info);
 
+/// A fragment shader writing zero to `num_outputs` float color outputs (locations 0..n-1).
+[[nodiscard]] std::vector<u32> EmitZeroFragmentShader(u32 num_outputs);
+
 } // namespace Shader::Backend::SPIRV

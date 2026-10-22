@@ -398,4 +398,31 @@ std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, const HwFragmentRunt
     return ctx.Assemble();
 }
 
+std::vector<u32> EmitZeroFragmentShader(u32 num_outputs) {
+    Sirit::Module module{SPIRV_VERSION_1_5};
+    module.AddCapability(spv::Capability::Shader);
+    module.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
+    const Id void_id{module.TypeVoid()};
+    const Id vec4_id{module.TypeVector(module.TypeFloat(32), 4)};
+    const Id output_type{module.TypePointer(spv::StorageClass::Output, vec4_id)};
+    const Id zero{module.ConstantNull(vec4_id)};
+    std::vector<Id> outputs;
+    for (u32 location = 0; location < num_outputs; ++location) {
+        const Id output{module.AddGlobalVariable(output_type, spv::StorageClass::Output)};
+        module.Decorate(output, spv::Decoration::Location, location);
+        outputs.push_back(output);
+    }
+    const Id main{
+        module.OpFunction(void_id, spv::FunctionControlMask::MaskNone, module.TypeFunction(void_id))};
+    module.AddLabel();
+    for (const Id output : outputs) {
+        module.OpStore(output, zero);
+    }
+    module.OpReturn();
+    module.OpFunctionEnd();
+    module.AddEntryPoint(spv::ExecutionModel::Fragment, main, "main", outputs);
+    module.AddExecutionMode(main, spv::ExecutionMode::OriginUpperLeft);
+    return module.Assemble();
+}
+
 } // namespace Shader::Backend::SPIRV
