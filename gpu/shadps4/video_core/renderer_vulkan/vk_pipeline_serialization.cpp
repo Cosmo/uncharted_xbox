@@ -11,6 +11,12 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <string_view>
+#include <fmt/format.h>
+
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 #ifdef UNCHARTED_UWP
@@ -398,6 +404,26 @@ void PipelineCache::WarmUp() {
 
 // bbport (Xbox): the driver's own pipeline cache is kept beside the pipeline keys. Dozen stores the
 // DXIL of every pipeline in it, so a warm-up only creates the D3D12 pipeline states again.
+//
+// The Xbox's Dozen reports another pipelineCacheUUID on every start (same driver build and GPU),
+// so it ignored every saved cache. The cache is saved with the driver's identity (BBDC1 header):
+// with the same identity, the saved header takes this start's UUID; another driver starts empty.
+namespace {
+constexpr std::array<u8, 8> DriverCacheMagic{'B', 'B', 'D', 'C', '1', 0, 0, 0};
+
+std::string DriverIdentity(const Instance& instance) {
+    const auto chain = instance.GetPhysicalDevice()
+                           .getProperties2<vk::PhysicalDeviceProperties2,
+                                           vk::PhysicalDeviceDriverProperties>();
+    const auto& properties = chain.get<vk::PhysicalDeviceProperties2>().properties;
+    const auto& driver = chain.get<vk::PhysicalDeviceDriverProperties>();
+    return fmt::format("{:04x}:{:04x} {:08x} {} {} {}", properties.vendorID, properties.deviceID,
+                       properties.driverVersion, u32(driver.driverID),
+                       std::string_view(driver.driverName.data()),
+                       std::string_view(driver.driverInfo.data()));
+}
+} // namespace
+
 void PipelineCache::LoadDriverCache() {
     const auto started = std::chrono::steady_clock::now();
     std::vector<u8> data;
@@ -405,7 +431,26 @@ void PipelineCache::LoadDriverCache() {
     if (data.empty()) {
         return;
     }
-    // The driver ignores the data of another driver build or GPU (its header).
+    bool adopted = false;
+    if (data.size() >= DriverCacheMagic.size() + 4 &&
+        std::equal(DriverCacheMagic.begin(), DriverCacheMagic.end(), data.begin())) {
+        u32 length = 0;
+        std::memcpy(&length, data.data() + DriverCacheMagic.size(), 4);
+        const size_t header = DriverCacheMagic.size() + 4 + length;
+        if (header > data.size() ||
+            std::string_view(reinterpret_cast<const char*>(data.data()) + DriverCacheMagic.size() + 4,
+                             length) != DriverIdentity(instance)) {
+            std::puts("Driver pipeline cache: saved by another driver; starting empty");
+            return;
+        }
+        data.erase(data.begin(), data.begin() + header);
+        // VkPipelineCacheHeaderVersionOne: the UUID follows size, version, vendor and device.
+        const auto uuid = instance.GetPhysicalDevice().getProperties().pipelineCacheUUID;
+        if (data.size() >= 32 && !std::equal(uuid.begin(), uuid.end(), data.begin() + 16)) {
+            std::copy(uuid.begin(), uuid.end(), data.begin() + 16);
+            adopted = true;
+        }
+    }
     const auto device = instance.GetDevice();
     auto [result, loaded] = device.createPipelineCacheUnique(
         vk::PipelineCacheCreateInfo{.initialDataSize = data.size(), .pInitialData = data.data()});
@@ -418,8 +463,8 @@ void PipelineCache::LoadDriverCache() {
     if (device.getPipelineCacheData(*pipeline_cache, &size, nullptr) == vk::Result::eSuccess) {
         driver_cache_size = size;
     }
-    std::printf("Driver pipeline cache: %zu KiB read, %zu KiB kept, %.1f ms\n", data.size() >> 10,
-                driver_cache_size >> 10,
+    std::printf("Driver pipeline cache: %zu KiB read, %zu KiB kept%s, %.1f ms\n", data.size() >> 10,
+                driver_cache_size >> 10, adopted ? " (header given this start's UUID)" : "",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
                     .count());
 }
@@ -431,11 +476,18 @@ void PipelineCache::SaveDriverCache() {
         size == driver_cache_size) {
         return;
     }
-    std::vector<u8> data(size);
-    if (device.getPipelineCacheData(*pipeline_cache, &size, data.data()) != vk::Result::eSuccess) {
+    const std::string identity = DriverIdentity(instance);
+    const size_t header = DriverCacheMagic.size() + 4 + identity.size();
+    std::vector<u8> data(header + size);
+    if (device.getPipelineCacheData(*pipeline_cache, &size, data.data() + header) !=
+        vk::Result::eSuccess) {
         return;
     }
-    data.resize(size);
+    data.resize(header + size);
+    std::copy(DriverCacheMagic.begin(), DriverCacheMagic.end(), data.begin());
+    const u32 length = u32(identity.size());
+    std::memcpy(data.data() + DriverCacheMagic.size(), &length, 4);
+    std::memcpy(data.data() + DriverCacheMagic.size() + 4, identity.data(), identity.size());
     driver_cache_size = size;
     Storage::DataBase::Instance().Save(Storage::BlobType::DriverCache, "driver", std::move(data));
     std::printf("Driver pipeline cache: %zu KiB saved\n", size >> 10);
