@@ -524,7 +524,7 @@ static void loader() {
            key=="BB_RECORDER_TIMINGS"||key=="BB_BAKED_PIPELINES"||
            key=="BB_PERF_DIAG"||key=="BB_PREP_WORKERS"||key=="BB_COPY_THREADS"||key=="BB_CHOOSE_DUMP"||
            key=="BB_READ_FAULT_EVERY"||key=="BB_RENDER_720P"||key=="BB_DRED"||key=="BB_GPU_CHECKPOINTS"||key=="BB_SKIP_SHADERS"||key=="BB_GPU_CHECKPOINTS_FROM"||key=="BB_DUMP_GCN"||
-           key=="BB_FRAME_DUMP_TRIGGER"||key=="BB_DUMP_DIR") {
+           key=="BB_FRAME_DUMP_TRIGGER"||key=="BB_DUMP_DIR"||key=="BB_START_MENU") {
             _putenv_s(key.c_str(),value.c_str());
             SetEnvironmentVariableW(winrt::to_hstring(key).c_str(),winrt::to_hstring(value).c_str());
         }
@@ -640,6 +640,8 @@ static void loader() {
     if(!prepare_game(dump,exe,prepared,player,mode=="prepare")||mode=="prepare") { finished=true; return; }
     std::string boot=prepared+"\\boot-linked.bin";
     std::string content=prepared+"\\content.bin";
+    // Shader preparation (start menu): the game whose data folder is scanned and whose library is used.
+    _putenv_s("BB_PRECOMPILE_GAME",stem=="big2" ? "u2" : stem=="big3" ? "u3" : "u1");
     _putenv_s("BB_CONFIG",(user+"\\graphics.cfg").c_str());
     _putenv_s("BB_PAD_FILE",(winrt::to_string(local)+"\\controls.txt").c_str());
     _putenv_s("BB_VMA_DUMP",(winrt::to_string(local)+"\\vma.json").c_str());  // overlay.cpp: Vulkan allocations

@@ -118,6 +118,12 @@ public:
 private:
     Frame* GetRenderFrame();
 
+    /// bbport: a frame of only the overlay (start menu, shader preparation progress).
+    void PresentLoadingFrame();
+    /// bbport (UWP app): the start menu before the game, and shader preparation (BbPrecompile):
+    /// on a game's first start, and when chosen in the menu.
+    void RunStartMenu();
+
     void RecreateFrame(Frame* frame, u32 width, u32 height);
     /// bbport: the images frame generation writes for `frame` (its size, made once).
     void EnsureGenerated(Frame* frame);

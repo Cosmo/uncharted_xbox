@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "bbport_precompile.h"
 
 namespace Vulkan {
 
@@ -828,8 +829,21 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
     CompileTimer timer;
 
-    const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
-    auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    // bbport: shaders prepared ahead of the game (start menu, BbPrecompile) skip the translation.
+    std::vector<u32> spv;
+    static std::atomic<u32> prepared_hits{0}, translated{0};
+    if (BbPrecompile::TryLoad(info, runtime_info, code, profile, spv, binding)) {
+        prepared_hits.fetch_add(1, std::memory_order_relaxed);
+        info.AddBindings(binding);
+    } else {
+        translated.fetch_add(1, std::memory_order_relaxed);
+        const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+        spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    }
+    if (const u32 total = prepared_hits + translated; total % 50 == 0) {
+        std::printf("Shaders: %u prepared ahead, %u translated during play\n", prepared_hits.load(),
+                    translated.load());
+    }
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
     vk::ShaderModule module;

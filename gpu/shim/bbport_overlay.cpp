@@ -56,6 +56,16 @@ bool dirty = false; // settings changed while open: saved on close
 // The game's text dialog (SetTextEntry), guarded by imgui_mutex.
 bool text_entry_active = false;
 std::string text_entry_prompt, text_entry_text;
+// The start menu and shader preparation (presenter, before the game): a list chosen with the
+// arrows/D-pad, and a progress screen.
+std::atomic<bool> choice_active{false};
+std::string choice_title;
+std::vector<std::string> choice_items;
+int choice_index = 0;
+std::atomic<int> choice_result{-1}; // -1 open, -2 cancelled, else the chosen index
+std::atomic<bool> loading{false};
+std::string loading_label;
+std::atomic<u32> loading_done{0}, loading_total{0};
 float base_scale = 1.0f;
 
 // Present rate for the FPS counter.
@@ -407,6 +417,83 @@ void Menu() {
     }
 }
 
+void ChoiceBox() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(viewport->WorkSize.x * 0.36f, 0.0f),
+                                        ImVec2(viewport->WorkSize.x * 0.8f, viewport->WorkSize.y * 0.8f));
+    ImGui::SetNextWindowBgAlpha(0.94f);
+    ImGui::Begin("##choice", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::TextColored(ImVec4(0.85f, 0.72f, 0.45f, 1.0f), "%s", choice_title.c_str());
+    ImGui::Separator();
+    for (int i = 0; i < int(choice_items.size()); ++i) {
+        if (i == choice_index) {
+            ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.55f, 1.0f), "> %s", choice_items[i].c_str());
+        } else {
+            ImGui::Text("  %s", choice_items[i].c_str());
+        }
+    }
+    ImGui::Separator();
+    ImGui::TextDisabled("D-pad: choose   A: OK");
+    ImGui::End();
+}
+
+void LoadingScreen() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x * 0.4f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.0f);
+    ImGui::Begin("##loading", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
+    const u32 done = loading_done, total = loading_total;
+    ImGui::SetWindowFontScale(1.6f);
+    ImGui::TextUnformatted(loading_label.empty() ? "Preparing graphics..." : loading_label.c_str());
+    ImGui::SetWindowFontScale(1.0f);
+    if (total) {
+        char count[64];
+        std::snprintf(count, sizeof(count), "%u / %u (%u%%)", done, total,
+                      u32(u64(done) * 100 / total));
+        ImGui::ProgressBar(float(done) / float(total), ImVec2(-1.0f, 0.0f), count);
+    }
+    ImGui::TextDisabled("Other shaders are prepared during play.");
+    ImGui::End();
+}
+
+// The start menu takes the keys and buttons that move and confirm.
+bool HandleChoiceEvent(const SDL_Event& event) {
+    int move = 0, finish = 0; // finish: 1 accept, 2 cancel
+    if (event.type == SDL_EVENT_KEY_DOWN) {
+        const SDL_Keycode key = event.key.key;
+        move = key == SDLK_UP || key == SDLK_W ? -1 : key == SDLK_DOWN || key == SDLK_S ? 1 : 0;
+        finish = key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE ? 1
+                 : key == SDLK_ESCAPE || key == SDLK_BACKSPACE                   ? 2
+                                                                                 : 0;
+    } else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        const u8 button = event.gbutton.button;
+        move = button == SDL_GAMEPAD_BUTTON_DPAD_UP ? -1 : button == SDL_GAMEPAD_BUTTON_DPAD_DOWN ? 1 : 0;
+        finish = button == SDL_GAMEPAD_BUTTON_SOUTH ? 1 : button == SDL_GAMEPAD_BUTTON_EAST ? 2 : 0;
+    } else {
+        return event.type == SDL_EVENT_KEY_UP || event.type == SDL_EVENT_GAMEPAD_BUTTON_UP;
+    }
+    const int count = int(choice_items.size());
+    if (move && count) {
+        choice_index = (choice_index + move + count) % count;
+    }
+    if (finish) {
+        choice_result = finish == 1 && count ? choice_index : -2;
+        choice_active = false;
+    }
+    return true;
+}
+
 // The game's text dialog: what is typed, and how to finish (keyboard or controller).
 void TextEntryBox() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -552,6 +639,9 @@ bool HandleEvent(const SDL_Event& event) {
     if (!initialized) {
         return false;
     }
+    if (choice_active) {
+        return HandleChoiceEvent(event);
+    }
     ImGuiIO& io = ImGui::GetIO();
     const bool is_open = menu_open;
     switch (event.type) {
@@ -638,11 +728,36 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || text_entry_active || BbSettings::Get().show_fps);
+    return initialized && (menu_open || text_entry_active || choice_active || loading ||
+                           BbSettings::Get().show_fps);
 }
 
 bool CapturesInput() {
-    return menu_open || text_entry_active;
+    return menu_open || text_entry_active || choice_active;
+}
+
+void SetLoading(bool active, u32 done, u32 total) {
+    loading_done = done;
+    loading_total = total;
+    loading = active;
+}
+
+void SetLoadingLabel(const std::string& label) {
+    std::scoped_lock lock{imgui_mutex};
+    loading_label = label;
+}
+
+void BeginChoice(const std::string& title, const std::vector<std::string>& items, int focus) {
+    std::scoped_lock lock{imgui_mutex};
+    choice_title = title;
+    choice_items = items;
+    choice_index = focus >= 0 && focus < int(items.size()) ? focus : 0;
+    choice_result = -1;
+    choice_active = true;
+}
+
+int PollChoice() {
+    return choice_result;
 }
 
 void SetTextEntry(bool active, const std::string& prompt, const std::string& text) {
@@ -710,6 +825,12 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (text_entry_active) {
         TextEntryBox();
+    }
+    if (loading) {
+        LoadingScreen();
+    }
+    if (choice_active) {
+        ChoiceBox();
     }
     ImGui::Render();
 

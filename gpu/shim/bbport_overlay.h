@@ -41,4 +41,12 @@ bool CapturesInput();
 /// `active` is false; typing goes to the window (sdl_window), the box only displays it.
 void SetTextEntry(bool active, const std::string& prompt, const std::string& text);
 
+/// Shader preparation before the game: a progress screen (`total` 0 shows no count) and its title.
+void SetLoading(bool active, u32 done, u32 total);
+void SetLoadingLabel(const std::string& label);
+/// The start menu: a list chosen with the arrows/D-pad. PollChoice: -1 while open, -2 cancelled,
+/// else the chosen index.
+void BeginChoice(const std::string& title, const std::vector<std::string>& items, int focus);
+int PollChoice();
+
 } // namespace BbOverlay

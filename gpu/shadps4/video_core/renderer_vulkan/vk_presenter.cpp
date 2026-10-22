@@ -17,6 +17,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "bbport_overlay.h"
+#include "bbport_precompile.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -178,6 +179,137 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 
     frame_generator = std::make_unique<FrameGenerator>(instance, draw_scheduler);
     rasterizer->GetUpscaler().SetFrameGenerator(frame_generator.get());
+#ifdef UNCHARTED_UWP
+    RunStartMenu();
+#endif
+}
+
+void Presenter::PresentLoadingFrame() {
+    if (window.GetWidth() == 0 || window.GetHeight() == 0) {
+        return;
+    }
+    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    }
+    if (!swapchain.AcquireNextImage()) {
+        return;
+    }
+    const vk::Image image = swapchain.Image();
+    const vk::Extent2D extent = swapchain.GetExtent();
+    const auto cmdbuf = present_scheduler.CommandBuffer();
+    const vk::ImageSubresourceRange range{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .levelCount = 1,
+        .layerCount = VK_REMAINING_ARRAY_LAYERS,
+    };
+    const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::AccessFlags src,
+                             vk::AccessFlags dst) {
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                               vk::PipelineStageFlagBits::eAllCommands, {}, {}, {},
+                               vk::ImageMemoryBarrier{
+                                   .srcAccessMask = src,
+                                   .dstAccessMask = dst,
+                                   .oldLayout = from,
+                                   .newLayout = to,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .image = image,
+                                   .subresourceRange = range,
+                               });
+    };
+    barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal, {},
+            vk::AccessFlagBits::eTransferWrite);
+    cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal,
+                           vk::ClearColorValue{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}},
+                           range);
+    barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eColorAttachmentOptimal,
+            vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eColorAttachmentWrite);
+    BbOverlay::Render(cmdbuf, swapchain.ImageView(), extent);
+    barrier(vk::ImageLayout::eColorAttachmentOptimal, Swapchain::PresentLayout(),
+            vk::AccessFlagBits::eColorAttachmentWrite, {});
+    SubmitInfo info{};
+    info.AddWait(swapchain.GetImageAcquiredSemaphore());
+    info.AddSignal(swapchain.GetPresentReadySemaphore());
+    present_scheduler.Flush(info);
+    {
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        swapchain.Present();
+    }
+    // A few frames a second before the game: waiting keeps semaphores and the swapchain simple.
+    present_scheduler.Finish();
+}
+
+void Presenter::RunStartMenu() {
+    const char* launcher = std::getenv("BB_UWP_LAUNCHER");
+    const char* dump = std::getenv("BB_PRECOMPILE_DUMP");
+    if (!launcher || *launcher != '1' || !dump || !*dump) {
+        return;
+    }
+    // The game's data folder (u1data, u2data, u3data) and its prepared shader library.
+    const char* game_env = std::getenv("BB_PRECOMPILE_GAME");
+    const std::string game = game_env && *game_env ? game_env : "u1";
+    const std::filesystem::path data = std::filesystem::path(dump) / (game + "data");
+    const auto cache = BbPrecompile::CacheDirectory();
+    const auto marker = cache / "prepared.txt";
+    std::string status;
+    const auto precompile = [&] {
+        try {
+            auto last = std::chrono::steady_clock::time_point{};
+            const auto started = std::chrono::steady_clock::now();
+            const auto result = BbPrecompile::Prepare(
+                data, cache, rasterizer->GetPipelineCache().GetProfile(), [&](const auto& progress) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - last < std::chrono::milliseconds(100) && progress.done != progress.total) {
+                        return;
+                    }
+                    last = now;
+                    BbOverlay::SetLoadingLabel(progress.scanning ? "Scanning game files..."
+                                               : progress.vertex ? "Preparing vertex shaders..."
+                                                                 : "Preparing pixel shaders...");
+                    BbOverlay::SetLoading(true, progress.done, progress.total);
+                    PresentLoadingFrame();
+                });
+            const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - started).count();
+            status = fmt::format("{} shaders prepared in {} s.{}", result.prepared_entries, seconds,
+                                 result.failed ? " Some could not be prepared." : "");
+            std::printf("Shader preparation (%s): %u shaders from %u files, %u compiled, %u reused, "
+                        "%u skipped, %u failed, %lld s\n", game.c_str(), result.prepared_entries,
+                        result.archives, result.compiled, result.already_cached, result.skipped,
+                        result.failed, static_cast<long long>(seconds));
+            std::ofstream(marker) << status << "\n";
+        } catch (const std::exception& error) {
+            status = std::string("Shader preparation could not finish: ") + error.what();
+            std::printf("Shader preparation failed: %s\n", error.what());
+        }
+        BbOverlay::SetLoading(false, 0, 0);
+        BbOverlay::SetLoadingLabel({});
+    };
+    // A game's first start prepares its shaders before the menu (BB_PRECOMPILE_AUTORUN=1: always).
+    const char* autorun = std::getenv("BB_PRECOMPILE_AUTORUN");
+    std::error_code error;
+    if ((autorun && *autorun == '1') || !std::filesystem::exists(marker, error)) {
+        precompile();
+    }
+    // BB_START_MENU=0 (graphics-debug.txt, automated tests): straight into the game.
+    const char* menu = std::getenv("BB_START_MENU");
+    if (menu && *menu == '0') {
+        return;
+    }
+    for (;;) {
+        BbOverlay::BeginChoice(status.empty() ? "Uncharted: The Nathan Drake Collection"
+                                              : "Uncharted: The Nathan Drake Collection\n" + status,
+                               {"Start game", "Prepare shaders again"}, 0);
+        int choice;
+        while ((choice = BbOverlay::PollChoice()) == -1) {
+            PresentLoadingFrame();
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        if (choice != 1) {
+            return;
+        }
+        precompile();
+    }
 }
 
 Presenter::~Presenter() {

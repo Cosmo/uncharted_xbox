@@ -49,9 +49,55 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
+namespace {
+thread_local const FetchShaderSnapshot* compiler_snapshot = nullptr;
+}
+
+AmdGpu::Buffer VertexAttribute::GetSharp(const Shader::Info& info) const noexcept {
+    if (compiler_snapshot && compiler_snapshot->info == &info && compiler_snapshot->fetch) {
+        const auto& attributes = compiler_snapshot->fetch->attributes;
+        for (size_t i = 0; i < attributes.size(); ++i) {
+            if (attributes[i] == *this) {
+                return compiler_snapshot->buffers[i];
+            }
+        }
+        UNREACHABLE_MSG("Fetch attribute missing from compiler snapshot");
+    }
+    auto buffer = info.ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
+    buffer.base_address += inst_offset;
+    if (data_format) {
+        buffer.data_format = data_format;
+        buffer.num_format = num_format;
+    }
+    return buffer;
+}
+
+void FetchShaderSnapshot::Capture(const Info& source) {
+    info = &source;
+    fetch = ParseFetchShader(source);
+    buffers.clear();
+    if (fetch) {
+        for (const auto& attribute : fetch->attributes) {
+            buffers.push_back(attribute.GetSharp(source));
+        }
+    }
+}
+
+ScopedFetchShaderSnapshot::ScopedFetchShaderSnapshot(const FetchShaderSnapshot& snapshot)
+    : previous{compiler_snapshot} {
+    compiler_snapshot = &snapshot;
+}
+
+ScopedFetchShaderSnapshot::~ScopedFetchShaderSnapshot() {
+    compiler_snapshot = previous;
+}
+
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (!info.has_fetch_shader) {
         return std::nullopt;
+    }
+    if (compiler_snapshot && compiler_snapshot->info == &info) {
+        return compiler_snapshot->fetch;
     }
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
