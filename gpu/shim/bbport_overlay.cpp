@@ -407,6 +407,39 @@ void Menu() {
     }
 #endif
 
+#ifdef UNCHARTED_UWP
+    // The Xbox has no mouse to hover the "(?)" hints: the notes stand under their rows.
+    const auto note = [](const char* text) {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%s", text);
+        ImGui::PopTextWrapPos();
+    };
+    ImGui::SeparatorText("Controller");
+    int vibration = s.vibration;
+    if (ImGui::SliderInt("Vibration", &vibration, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) {
+        Store(s.vibration, vibration, true);
+    }
+    note("Strength of the controller's vibration. 0% turns it off.");
+
+    ImGui::SeparatorText("Applied at the next start");
+    static const char* resolutions[] = {"720p · 1280 × 720", "1080p · 1920 × 1080 (native)"};
+    const int resolution = s.render_720p ? 0 : 1;
+    if (ImGui::BeginCombo("Render resolution", resolutions[resolution])) {
+        for (int i = 0; i < 2; ++i) {
+            if (ImGui::Selectable(resolutions[i], i == resolution)) {
+                Store(s.render_720p, i == 0, true);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    note("The resolution the game draws at. 1080p is sharper and slower, and needs more of the "
+         "Xbox's memory.");
+    if (s.render_720p != s.startup_render_720p) {
+        ImGui::TextColored(ImVec4(0.85f, 0.72f, 0.45f, 1.0f),
+                           "Takes effect the next time you start the app.");
+    }
+#endif
+
     ImGui::SeparatorText("Other");
     Checkbox("FPS counter in the corner", s.show_fps);
 

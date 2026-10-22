@@ -66,6 +66,10 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.fsr4_invert_jitter = i != 0;
     } else if (key == "model_lod") {
         v.model_lod = std::clamp(i, -2, 2);
+    } else if (key == "render_resolution") {
+        v.render_720p = value != "1080p";
+    } else if (key == "vibration") {
+        v.vibration = std::clamp(i, 0, 100);
     } else if (key == "live_resolution") {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
     } else if (key == "output_res") {
@@ -137,6 +141,9 @@ void Load() {
     v.startup_model_lod = v.model_lod;
     v.startup_output_res = v.output_res;
     v.startup_live_resolution = v.live_resolution;
+    // The resolution this start uses: BB_RENDER_720P (graphics-debug.txt) wins over the file.
+    const char* render720p = std::getenv("BB_RENDER_720P");
+    v.startup_render_720p = render720p ? render720p[0] != '0' : v.render_720p.load();
 }
 
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
@@ -215,6 +222,9 @@ void Save() {
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");
+    // Read by the Xbox app (main.cpp, input) at start.
+    std::fprintf(file, "render_resolution=%s\nvibration=%d\n", v.render_720p ? "720p" : "1080p",
+                 v.vibration.load());
     std::fclose(file);
 }
 

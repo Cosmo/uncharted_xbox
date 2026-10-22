@@ -84,6 +84,11 @@ struct Values {
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
     /// on the Steam Deck and older GPUs), -1 auto (strong discrete GPUs), 1 on. On restart.
     std::atomic<int> live_resolution{0};
+    /// Xbox app: the game draws at 1280x720 (its start patch) or at its own 1920x1080; the app
+    /// reads it from the file when it starts (main.cpp).
+    std::atomic<bool> render_720p{true};
+    /// Strength of the controller's vibration, 0..100 % (Xbox app).
+    std::atomic<int> vibration{100};
     /// Why FSR 4 cannot run (assets, device features), or null. Set by the renderer.
     std::atomic<const char*> fsr4_problem{nullptr};
     std::atomic<bool> fsr4_supported{false}, fsr411_supported{false};
@@ -105,6 +110,7 @@ struct Values {
     int startup_model_lod = 0;
     int startup_output_res = OutputDefault;
     int startup_live_resolution = 0;
+    bool startup_render_720p = true;
 };
 
 Values& Get();

@@ -705,10 +705,13 @@ static void loader() {
 #endif
     arguments.insert(arguments.end(),{"--content-profile",content,"--app0",dump,"--user",user,"--timeout","0"});
     if(!guest_argv.empty()) arguments.insert(arguments.end(),{"--guest-argv",guest_argv});
-    // The game renders at 1280x720 (menus and movies too) unless BB_RENDER_720P=0 (graphics-debug.txt).
+    // The game renders at 1280x720 (menus and movies too) unless the menu's render resolution is
+    // 1080p (graphics.cfg); BB_RENDER_720P (graphics-debug.txt) still wins.
     const std::string render720p=prepared+"\\render720p.bin";
     const char* render720p_setting=std::getenv("BB_RENDER_720P");
-    const bool use720p=!(render720p_setting&&*render720p_setting=='0')&&
+    const bool want720p=render720p_setting ? *render720p_setting!='0'
+                                           : setting("render_resolution","720p")!="1080p";
+    const bool use720p=want720p&&
         GetFileAttributesW(winrt::to_hstring(render720p).c_str())!=INVALID_FILE_ATTRIBUTES;
     if(use720p) arguments.insert(arguments.end(),{"--patches",render720p});
     std::printf("Render resolution: %s\n",use720p ? "1280x720" : "1920x1080");

@@ -880,7 +880,8 @@ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     if (!param) return ERR_INVALID_ARG;
     pthread_mutex_lock(&lock);
 #ifdef UNCHARTED_UWP
-    uncharted_uwp_vibration(param[0],param[1]);
+    const int strength=bbgpu_vibration_percent(); /* the menu's Vibration, 0..100 % */
+    uncharted_uwp_vibration((uint8_t)(param[0]*strength/100),(uint8_t)(param[1]*strength/100));
 #else
     SDL_Gamepad *g=current_gamepad();
     if (g) SDL_RumbleGamepad(g,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257),1000);
