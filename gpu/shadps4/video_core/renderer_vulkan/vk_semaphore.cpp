@@ -28,6 +28,9 @@ extern bool g_device_fault_ext;
 namespace VideoCore {
 void DumpBuffersNear(u64 address);
 }
+#ifdef UNCHARTED_UWP
+extern "C" void uncharted_uwp_dred_report(const void* vk_device); // the crash as D3D12 saw it (present_bridge.cpp)
+#endif
 namespace Vulkan {
 
 // bbport: the GPU crashed (device lost). The driver's description of the fault is printed and
@@ -76,6 +79,9 @@ namespace Vulkan {
     } else {
         std::printf("GPU crash: the driver gives no details (VK_EXT_device_fault unavailable)\n");
     }
+#ifdef UNCHARTED_UWP
+    uncharted_uwp_dred_report(static_cast<const void*>(static_cast<VkDevice>(device)));
+#endif
     if (g_gpu_checkpoint_report) {
         g_gpu_checkpoint_report();
     }

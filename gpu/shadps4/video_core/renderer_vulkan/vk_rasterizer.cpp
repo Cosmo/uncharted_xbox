@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <map>
+#include <unordered_set>
 #include "core/libraries/videoout/driver.h"
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
@@ -53,6 +54,7 @@ u32 ConstCheckHash() {
 
 extern bool (*g_draw_pipe_busy)();
 extern bool g_gpu_checkpoints;
+extern bool g_soft_checkpoints;
 extern VkQueue g_crash_queue;
 extern void (*g_gpu_checkpoint_report)();
 } // namespace Vulkan
@@ -129,7 +131,117 @@ void PrintCheckpoint(u64 seq) {
     }
 }
 
+// Without the NV extension (Dozen): the command buffer that recorded each checkpoint, in
+// recording order. One command buffer is one D3D12 command list, so the draws and dispatches
+// D3D12's breadcrumbs count in the list that did not finish lead to the checkpoint.
+struct SoftCheckpoint {
+    VkCommandBuffer cmdbuf;
+    u64 seq;
+};
+std::unique_ptr<SoftCheckpoint[]> soft_ring;
+std::atomic<u64> soft_count{0};
+
+void SetCheckpoint(vk::CommandBuffer cmdbuf, const void* checkpoint) {
+    if (!g_soft_checkpoints) {
+        cmdbuf.setCheckpointNV(checkpoint);
+        return;
+    }
+    const u64 n = soft_count.fetch_add(1, std::memory_order_relaxed);
+    soft_ring[n % CheckpointRingSize] = {static_cast<VkCommandBuffer>(cmdbuf),
+                                         static_cast<u64>(reinterpret_cast<uintptr_t>(checkpoint))};
+}
+
+char CheckpointLetter(u64 seq) {
+    const auto& r = checkpoint_ring[seq % CheckpointRingSize];
+    if (r.seq != seq) {
+        return '?';
+    }
+    const std::string_view kind = r.kind;
+    return kind == "draw" ? 'D' : kind == "dispatch" ? 'C' : kind == "indirect dispatch" ? 'J' : 'I';
+}
+
+// The last recordings (consecutive checkpoints of one command buffer), oldest first, with their
+// draws (D), indirect draws (I), dispatches (C) and indirect dispatches (J); DRED prints the
+// same letters for the list the GPU stopped in.
+void ReportSoftCheckpoints() {
+    const u64 end = soft_count.load();
+    const u64 begin = end > CheckpointRingSize ? end - CheckpointRingSize : 0;
+    struct Segment {
+        VkCommandBuffer cmdbuf;
+        u64 first, last; // soft_ring indices
+    };
+    std::vector<Segment> segments;
+    for (u64 n = end; n > begin && segments.size() < 40;) {
+        --n;
+        const auto& entry = soft_ring[n % CheckpointRingSize];
+        if (segments.empty() || segments.back().cmdbuf != entry.cmdbuf) {
+            segments.push_back({entry.cmdbuf, n, n});
+        } else {
+            segments.back().first = n;
+        }
+    }
+    std::printf("GPU crash: %llu checkpoints recorded; the last %zu recordings:\n",
+                static_cast<unsigned long long>(end), segments.size());
+    for (auto it = segments.rbegin(); it != segments.rend(); ++it) {
+        std::string letters;
+        for (u64 n = it->first; n <= it->last; ++n) {
+            letters += CheckpointLetter(soft_ring[n % CheckpointRingSize].seq);
+        }
+        if (letters.size() > 160) {
+            letters = "..." + letters.substr(letters.size() - 160);
+        }
+        std::printf("GPU crash:   cmdbuf %p #%llu-#%llu (%llu): %s\n",
+                    static_cast<void*>(it->cmdbuf),
+                    static_cast<unsigned long long>(soft_ring[it->first % CheckpointRingSize].seq),
+                    static_cast<unsigned long long>(soft_ring[it->last % CheckpointRingSize].seq),
+                    static_cast<unsigned long long>(it->last - it->first + 1), letters.c_str());
+    }
+    // The commands of the first recording that differs from the ones before it (a new scene's
+    // first frame, where a hang usually starts): BB_GPU_CHECKPOINTS_FROM=<seq> picks another.
+    u64 from = 0, to = 0;
+    if (const char* env = std::getenv("BB_GPU_CHECKPOINTS_FROM")) {
+        from = std::strtoull(env, nullptr, 10);
+        to = from + 400;
+    } else {
+        for (auto it = segments.rbegin(); it != segments.rend(); ++it) {
+            if (it->last - it->first + 1 > 64) {
+                from = soft_ring[it->first % CheckpointRingSize].seq;
+                to = soft_ring[it->last % CheckpointRingSize].seq;
+                break;
+            }
+        }
+    }
+    // Shaders not used by any earlier recorded command are named first (a hang usually comes with
+    // a new shader).
+    std::unordered_set<u64> earlier;
+    for (u64 seq = from > CheckpointRingSize - 1024 ? from - (CheckpointRingSize - 1024) : 1;
+         from && seq < from; ++seq) {
+        const auto& r = checkpoint_ring[seq % CheckpointRingSize];
+        if (r.seq == seq) {
+            earlier.insert(r.hashes[0]);
+            earlier.insert(r.hashes[1]);
+        }
+    }
+    for (u64 seq = from; from && seq <= to; ++seq) {
+        const auto& r = checkpoint_ring[seq % CheckpointRingSize];
+        for (const u64 hash : r.hashes) {
+            if (r.seq == seq && hash && earlier.insert(hash).second) {
+                std::printf("GPU crash: new shader %016llx in #%llu (%s)\n",
+                            static_cast<unsigned long long>(hash),
+                            static_cast<unsigned long long>(seq), r.kind);
+            }
+        }
+    }
+    for (u64 seq = from; from && seq <= to; ++seq) {
+        PrintCheckpoint(seq);
+    }
+}
+
 void ReportCheckpoints() {
+    if (g_soft_checkpoints) {
+        ReportSoftCheckpoints();
+        return;
+    }
     const auto get = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV;
     if (!g_crash_queue || !get) {
         return;
@@ -189,6 +301,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     GpuProfiler::Init(instance, scheduler);
     if (g_gpu_checkpoints) {
         checkpoint_ring = std::make_unique<CheckpointRecord[]>(CheckpointRingSize);
+        if (g_soft_checkpoints) {
+            soft_ring = std::make_unique<SoftCheckpoint[]>(CheckpointRingSize);
+        }
         g_gpu_checkpoint_report = &ReportCheckpoints;
         VideoCore::EnableFaultHistory();
     }
@@ -1617,7 +1732,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         if (checkpoint) {
-            cmdbuf.setCheckpointNV(checkpoint);
+            SetCheckpoint(cmdbuf, checkpoint);
         }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
         if (is_indexed) {
@@ -1780,7 +1895,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         if (checkpoint) {
-            cmdbuf.setCheckpointNV(checkpoint);
+            SetCheckpoint(cmdbuf, checkpoint);
         }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
         if (is_indexed) {
@@ -2042,7 +2157,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
             cmdbuf.pipelineBarrier2(dependency);
         }
         if (checkpoint) {
-            cmdbuf.setCheckpointNV(checkpoint);
+            SetCheckpoint(cmdbuf, checkpoint);
         }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
@@ -2102,7 +2217,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
                        0, size, 0, 0, address + offset);
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         if (checkpoint) {
-            cmdbuf.setCheckpointNV(checkpoint);
+            SetCheckpoint(cmdbuf, checkpoint);
         }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
         cmdbuf.dispatchIndirect(args, args_offset);

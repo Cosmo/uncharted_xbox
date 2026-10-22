@@ -30,6 +30,8 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                                   bool enable_crash_diagnostic);
 
 vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance);
+/// UWP: the driver's own errors and warnings (Dozen names the cause of a device loss) on stdout.
+vk::UniqueDebugUtilsMessengerEXT CreateDriverMessageCallback(vk::Instance instance);
 
 /// bbport: BB_GPU_ADDRESS_REPORT=1 (GPU address binding history for device-lost reports).
 bool AddressReportEnabled();

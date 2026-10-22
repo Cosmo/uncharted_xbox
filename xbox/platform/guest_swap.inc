@@ -230,15 +230,32 @@ static uint64_t uwp_swap_reclaim(uint64_t bytes,int include_views) {
     return result;
 }
 uint64_t runtime_memory_page_out(uint64_t bytes) { return uwp_swap_reclaim(bytes,1); }
+/* Guest memory held in host memory as the pager last counted it (every 5 s, uwp_swap_report): private pages the
+ * game touched, pages shared through sections, copies kept for unmapped pages. Read without locks by the metrics
+ * log (graphics/overlay.cpp), which runs on the presenter thread and must not wait for these locks. */
+static uint64_t uwp_resident_private,uwp_resident_shared,uwp_resident_saved;
+void runtime_memory_resident(uint64_t *private_bytes,uint64_t *shared_bytes,uint64_t *saved_bytes) {
+    *private_bytes=__atomic_load_n(&uwp_resident_private,__ATOMIC_RELAXED);
+    *shared_bytes=__atomic_load_n(&uwp_resident_shared,__ATOMIC_RELAXED);
+    *saved_bytes=__atomic_load_n(&uwp_resident_saved,__ATOMIC_RELAXED);
+}
 static void uwp_swap_report(void) {
     read_lock(); AcquireSRWLockExclusive(&uwp_commit_lock);
-    uint64_t resident=0,pinned=0;
+    uint64_t resident=0,pinned=0,committed=0,shared=0,saved=0;
     for(size_t i=0;i<uwp_count;++i) {
         const UwpPage *page=&uwp_pages[i];
+        if(page->mapped && page->kind==1 && page->committed) committed+=PAGE;
         if(!page->mapped || !page->pageable) continue;
         if(uwp_physical[page->physical/PAGE].pinned) pinned+=PAGE;
         else if(page->kind==1 && page->committed) resident+=PAGE;
     }
+    for(uint64_t i=0;uwp_physical && i<(POOL_SIZE+FLEX_SPAN)/PAGE;++i) {
+        if(uwp_physical[i].section) shared+=PAGE;
+        if(uwp_physical[i].saved) saved+=PAGE;
+    }
+    __atomic_store_n(&uwp_resident_private,committed,__ATOMIC_RELAXED);
+    __atomic_store_n(&uwp_resident_shared,shared,__ATOMIC_RELAXED);
+    __atomic_store_n(&uwp_resident_saved,saved,__ATOMIC_RELAXED);
     uint64_t out=uwp_swap_out,in=uwp_swap_in,disk=uwp_swap_disk_pages,views=uwp_swap_views;
     uint64_t checks=uwp_swap_hash_checks,errors=uwp_swap_hash_errors,evictions=uwp_swap_view_evictions;
     ReleaseSRWLockExclusive(&uwp_commit_lock); read_unlock();

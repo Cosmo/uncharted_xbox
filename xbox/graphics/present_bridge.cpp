@@ -7,6 +7,11 @@
 #include <stdexcept>
 #include <array>
 #include <cstring>
+#include <cstdlib>
+#include <algorithm>
+#include <string>
+#include <cwchar>
+#include <cwctype>
 
 extern "C" IUnknown* uncharted_uwp_core_window();
 using Microsoft::WRL::ComPtr;
@@ -24,7 +29,23 @@ static void Check(vk::Result result, const char* operation) {
         throw std::runtime_error(operation);
     }
 }
+// The D3D12 device Dozen renders with: D3D12 returns one device per adapter, so the presentation
+// device is the same object, and its removal data describes the game's GPU crash.
+static ComPtr<ID3D12Device> crash_device;
 void InitializeDriver() {
+    // BB_DRED=1 (graphics-debug.txt): D3D12 records breadcrumbs and page faults for a GPU crash report
+    // (uncharted_uwp_dred_report). It must be on before Dozen creates its device.
+    if (const char* dred=std::getenv("BB_DRED"); dred && *dred=='1') {
+        ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> settings;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&settings)))) {
+            settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            settings->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            std::printf("D3D12 DRED: breadcrumbs and page faults recorded\n");
+        } else {
+            std::printf("D3D12 DRED: unavailable\n");
+        }
+    }
     static HMODULE driver = LoadPackagedLibrary(L"vulkan_dzn.dll",0);
     if (!driver) throw std::runtime_error("Cannot load packaged Dozen driver");
     auto proc=reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(driver,"vk_icdGetInstanceProcAddr"));
@@ -94,6 +115,7 @@ Presenter::Presenter(vk::PhysicalDevice physical,vk::Device device,vk::Queue que
     ComPtr<IDXGIAdapter1> adapter;
     Check(factory->EnumAdapterByLuid(luid,IID_PPV_ARGS(&adapter)),"Find Dozen adapter");
     Check(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&p.native)),"Create presentation device");
+    crash_device=p.native;
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     Check(p.native->CreateCommandQueue(&queue_desc,IID_PPV_ARGS(&p.native_queue)),"Create presentation queue");
     DXGI_SWAP_CHAIN_DESC1 desc{};
@@ -187,4 +209,113 @@ bool Presenter::Present(bool vsync) {
     if(p.tick==1) std::puts("CoreWindow first frame presented");
     return true;
 }
+}
+
+// Dozen's D3D12 device: its device factory does not share devices with D3D12CreateDevice, so it is
+// found in Dozen's VkDevice structure (a field after the dispatch tables): the first pointer there to
+// a D3D12 object (its vtable in a d3d12 module) that is an ID3D12Device.
+static ComPtr<ID3D12Device> FindDozenDevice(const void* vk_device) {
+    auto readable=[](const void* address,size_t size) {
+        MEMORY_BASIC_INFORMATION info{};
+        if(!VirtualQuery(address,&info,sizeof info)||info.State!=MEM_COMMIT||(info.Protect&(PAGE_GUARD|PAGE_NOACCESS))) return false;
+        return static_cast<const char*>(address)+size<=static_cast<const char*>(info.BaseAddress)+info.RegionSize;
+    };
+    auto in_d3d12=[](const void* address) {
+        HMODULE module=nullptr;
+        if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                static_cast<LPCWSTR>(address),&module)) return false;
+        wchar_t name[MAX_PATH]{};
+        GetModuleFileNameW(module,name,MAX_PATH);
+        for(wchar_t* c=name;*c;++c) *c=static_cast<wchar_t>(towlower(*c));
+        return std::wcsstr(name,L"d3d12")!=nullptr;
+    };
+    const auto* words=static_cast<void* const*>(vk_device);
+    for(size_t i=0;i<0x10000/sizeof(void*);++i) {
+        if(!readable(words+i,sizeof(void*))) break;
+        void* object=words[i];
+        const auto value=reinterpret_cast<uintptr_t>(object);
+        if(value<0x10000||value>0x7fffffffffffull||value%8||!readable(object,sizeof(void*))) continue;
+        void* vtable=*static_cast<void**>(object);
+        if(!vtable||!readable(vtable,sizeof(void*))||!in_d3d12(vtable)||!in_d3d12(*static_cast<void**>(vtable))) continue;
+        ComPtr<ID3D12Device> device;
+        if(SUCCEEDED(static_cast<IUnknown*>(object)->QueryInterface(IID_PPV_ARGS(&device)))) {
+            std::printf("D3D12 DRED: Dozen's device %p (VkDevice + 0x%zx)\n",static_cast<void*>(device.Get()),i*sizeof(void*));
+            return device;
+        }
+    }
+    return {};
+}
+
+// The game's GPU crash as D3D12 saw it: why the device was removed, the command lists the GPU had not
+// finished with the operations around the one it stopped in, and the allocation a page fault hit
+// (with BB_DRED=1; without it only the reason).
+extern "C" void uncharted_uwp_dred_report(const void* vk_device) {
+    using namespace UnchartedUwp;
+    if(vk_device) if(auto dozen=FindDozenDevice(vk_device)) crash_device=dozen;
+    if(!crash_device) { std::printf("D3D12 DRED: no device\n"); return; }
+    const HRESULT reason=crash_device->GetDeviceRemovedReason();
+    const char* name=reason==DXGI_ERROR_DEVICE_HUNG ? "hung (a command ran too long)" :
+        reason==DXGI_ERROR_DEVICE_REMOVED ? "removed" : reason==DXGI_ERROR_DEVICE_RESET ? "reset (a bad command)" :
+        reason==DXGI_ERROR_DRIVER_INTERNAL_ERROR ? "driver internal error" : reason==DXGI_ERROR_INVALID_CALL ? "invalid call" : "?";
+    std::printf("D3D12 DRED: device removed reason 0x%08lx %s\n",static_cast<unsigned long>(reason),name);
+    ComPtr<ID3D12DeviceRemovedExtendedData1> dred;
+    if(FAILED(crash_device.As(&dred))) { std::printf("D3D12 DRED: no removal data\n"); return; }
+    static constexpr const char* ops[]={"SetMarker","BeginEvent","EndEvent","DrawInstanced","DrawIndexedInstanced",
+        "ExecuteIndirect","Dispatch","CopyBufferRegion","CopyTextureRegion","CopyResource","CopyTiles","ResolveSubresource",
+        "ClearRenderTargetView","ClearUnorderedAccessView","ClearDepthStencilView","ResourceBarrier","ExecuteBundle","Present",
+        "ResolveQueryData","BeginSubmission","EndSubmission","DecodeFrame","ProcessFrames","AtomicCopyBufferUint",
+        "AtomicCopyBufferUint64","ResolveSubresourceRegion","WriteBufferImmediate","DecodeFrame1","SetProtectedResourceSession",
+        "DecodeFrame2","ProcessFrames1","BuildRaytracingAccelerationStructure","EmitRaytracingAccelerationStructurePostbuildInfo",
+        "CopyRaytracingAccelerationStructure","DispatchRays","InitializeMetaCommand","ExecuteMetaCommand","EstimateMotion",
+        "ResolveMotionVectorHeap","SetPipelineState1","InitializeExtensionCommand","ExecuteExtensionCommand","DispatchMesh",
+        "EncodeFrame","ResolveEncoderOutputMetadata","Barrier","BeginCommandList"};
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 crumbs{};
+    if(const HRESULT result=dred->GetAutoBreadcrumbsOutput1(&crumbs);FAILED(result))
+        std::printf("D3D12 DRED: no breadcrumbs (0x%08lx)\n",static_cast<unsigned long>(result));
+    else {
+        int shown=0;
+        for(auto node=crumbs.pHeadAutoBreadcrumbNode;node&&shown<4;node=node->pNext) {
+            const UINT32 count=node->BreadcrumbCount,done=node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+            if(done>=count) continue;
+            ++shown;
+            std::printf("D3D12 DRED: list %p on queue %p: %u of %u operations completed\n",
+                static_cast<void*>(node->pCommandList),static_cast<void*>(node->pCommandQueue),done,count);
+            // Operations of each kind before the one the GPU stopped in (to match it with the renderer's draws).
+            UINT32 kinds[64]{};
+            for(UINT32 i=0;i<done&&i<count;++i) if(node->pCommandHistory[i]<64) ++kinds[node->pCommandHistory[i]];
+            std::printf("D3D12 DRED:   completed: draws %u, indexed draws %u, dispatches %u, barriers %u, copies %u\n",
+                kinds[3],kinds[4],kinds[6],kinds[15]+kinds[45],kinds[7]+kinds[8]+kinds[9]);
+            // The draws (D), indirect executions (I) and dispatches (C) as letters, "|" where the GPU
+            // stopped: the renderer's checkpoint report (BB_GPU_CHECKPOINTS=1) prints its recordings so.
+            std::string before,after;
+            for(UINT32 i=0;i<count;++i) {
+                const auto op=node->pCommandHistory[i];
+                const char letter=op==3||op==4 ? 'D' : op==5 ? 'I' : op==6 ? 'C' : 0;
+                if(letter) (i<done ? before : after)+=letter;
+            }
+            if(before.size()>160) before="..."+before.substr(before.size()-160);
+            if(after.size()>40) after=after.substr(0,40)+"...";
+            std::printf("D3D12 DRED:   %s|%s\n",before.c_str(),after.c_str());
+            const UINT32 first=done>8 ? done-8 : 0,last=std::min(count,done+6);
+            for(UINT32 i=first;i<last;++i) {
+                const auto op=node->pCommandHistory[i];
+                const wchar_t* context=L"";
+                for(UINT32 c=0;c<node->BreadcrumbContextsCount;++c)
+                    if(node->pBreadcrumbContexts[c].BreadcrumbIndex==i) context=node->pBreadcrumbContexts[c].pContextString;
+                std::printf("D3D12 DRED:   %s%u %s %ls\n",i==done ? "-> " : "   ",i,op<std::size(ops) ? ops[op] : "?",context);
+            }
+        }
+        if(!shown) std::printf("D3D12 DRED: every recorded command list completed\n");
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT1 fault{};
+    if(SUCCEEDED(dred->GetPageFaultAllocationOutput1(&fault))) {
+        if(!fault.PageFaultVA) std::printf("D3D12 DRED: no page fault\n");
+        else {
+            std::printf("D3D12 DRED: page fault at GPU address 0x%llx\n",static_cast<unsigned long long>(fault.PageFaultVA));
+            for(auto node=fault.pHeadExistingAllocationNode;node;node=node->pNext)
+                std::printf("D3D12 DRED:   existing allocation type %d %ls\n",static_cast<int>(node->AllocationType),node->ObjectNameW ? node->ObjectNameW : L"");
+            for(auto node=fault.pHeadRecentFreedAllocationNode;node;node=node->pNext)
+                std::printf("D3D12 DRED:   recently freed allocation type %d %ls\n",static_cast<int>(node->AllocationType),node->ObjectNameW ? node->ObjectNameW : L"");
+        }
+    }
 }

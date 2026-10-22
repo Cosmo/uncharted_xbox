@@ -27,6 +27,7 @@ bool g_device_fault_ext = false;
 // bbport diagnosis: BB_GPU_CHECKPOINTS=1 (VK_NV_device_diagnostic_checkpoints): the queue whose
 // last checkpoints a GPU crash report prints.
 bool g_gpu_checkpoints = false;
+bool g_soft_checkpoints = false; // UWP: checkpoints without the NV extension (vk_rasterizer.cpp)
 VkQueue g_crash_queue = VK_NULL_HANDLE;
 
 namespace {
@@ -118,6 +119,11 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
     if (enable_validation) {
         debug_callback = CreateDebugCallback(*instance);
     }
+#ifdef UNCHARTED_UWP
+    else {
+        debug_callback = CreateDriverMessageCallback(*instance);
+    }
+#endif
     if (AddressReportEnabled()) {
         address_report_callback = CreateAddressReportCallback(*instance);
     }
@@ -410,6 +416,12 @@ bool Instance::CreateDevice() {
     g_device_fault_ext = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     if (const char* env = std::getenv("BB_GPU_CHECKPOINTS"); env && env[0] == '1') {
         g_gpu_checkpoints = add_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+#ifdef UNCHARTED_UWP
+        // Dozen: the renderer logs which command buffer recorded each draw and dispatch instead,
+        // matched with D3D12's breadcrumbs (BB_DRED=1) after a crash.
+        g_soft_checkpoints = !g_gpu_checkpoints;
+        g_gpu_checkpoints = true;
+#endif
     }
     const bool address_report =
         AddressReportEnabled() && add_extension(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);

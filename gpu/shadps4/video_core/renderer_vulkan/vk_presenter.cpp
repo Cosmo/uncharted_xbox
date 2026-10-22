@@ -729,6 +729,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
 #ifdef UNCHARTED_UWP
     if(is_game_frame&&!is_reusing_frame) UnchartedUwp::Overlay::Presented();
+    UnchartedUwp::Overlay::Render(instance); // BB_UWP_METRICS=1: the metrics line every 5 s
 #endif
     // Free the frame for reuse
     const auto free_frame = [&] {

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "overlay.h"
+#include <cstdint>
 extern "C" void runtime_file_profile_report(void);
+extern "C" void runtime_memory_resident(uint64_t* private_bytes, uint64_t* shared_bytes, uint64_t* saved_bytes);
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include <vk_mem_alloc.h>
 #include <windows.h>
@@ -19,9 +21,13 @@ const auto started=Clock::now();
 std::array<float,120> frame_times{};
 size_t frame_index=0,frame_count=0;
 Clock::time_point last_frame{};
-const bool metrics=[] { auto value=std::getenv("BB_UWP_METRICS");return value&&*value=='1'; }();
+// Read on first use: graphics-debug.txt sets the variable after static initialization (main.cpp).
+bool MetricsOn() {
+    static const bool on=[] { auto value=std::getenv("BB_UWP_METRICS");return value&&*value=='1'; }();
+    return on;
 }
-bool Visible() { return metrics; }
+}
+bool Visible() { return MetricsOn(); }
 void Presented() {
     const auto now=Clock::now();
     if(last_frame!=Clock::time_point{}) {
@@ -32,7 +38,7 @@ void Presented() {
     last_frame=now;
 }
 void Render(const Vulkan::Instance& instance) {
-    if(!metrics) return;
+    if(!MetricsOn()) return;
     thread_local bool apartment=false;
     if(!apartment) {
         try {winrt::init_apartment(winrt::apartment_type::multi_threaded);}
@@ -68,9 +74,13 @@ void Render(const Vulkan::Instance& instance) {
         sum+=frame_times[(frame_index+frame_times.size()-1-count)%frame_times.size()];
     const float average=count ? sum/count : 0;
     const float fps=average>0 ? 1000/average : 0;
-    std::printf("UWP metrics: t=%lld fps=%.1f ms=%.1f cpu=%.1f ram=%llu limit=%llu gpu=%llu reserved=%llu MiB\n",
+    uint64_t guest_private=0,guest_shared=0,guest_saved=0;
+    runtime_memory_resident(&guest_private,&guest_shared,&guest_saved);
+    std::printf("UWP metrics: t=%lld fps=%.1f ms=%.1f cpu=%.1f ram=%llu limit=%llu gpu=%llu reserved=%llu "
+        "guest private=%llu shared=%llu saved=%llu MiB\n",
         std::chrono::duration_cast<std::chrono::seconds>(now-started).count(),fps,average,cpu,
-        used>>20,limit>>20,stats.total.statistics.allocationBytes>>20,stats.total.statistics.blockBytes>>20);
+        used>>20,limit>>20,stats.total.statistics.allocationBytes>>20,stats.total.statistics.blockBytes>>20,
+        guest_private>>20,guest_shared>>20,guest_saved>>20);
     reported=now;
     runtime_file_profile_report();
 }

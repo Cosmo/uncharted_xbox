@@ -13,6 +13,7 @@
 #define VK_USE_PLATFORM_XLIB_KHR
 #endif
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -559,6 +560,42 @@ vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance) {
     auto [messenger_result, messenger] = instance.createDebugUtilsMessengerEXTUnique(msg_ci);
     ASSERT_MSG(messenger_result == vk::Result::eSuccess, "Failed to create debug callback: {}",
                vk::to_string(messenger_result));
+    return std::move(messenger);
+}
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL DriverMessageCallback(
+    vk::DebugUtilsMessageSeverityFlagBitsEXT severity, vk::DebugUtilsMessageTypeFlagsEXT,
+    const vk::DebugUtilsMessengerCallbackDataEXT* data, void*) {
+    // Expected: a full descriptor pool (the renderer opens another) and SPIR-V translation notes.
+    const std::string_view message = data && data->pMessage ? data->pMessage : "";
+    if (message.starts_with("VK_ERROR_OUT_OF_POOL_MEMORY") || message.starts_with("SPIR-V offset")) {
+        return VK_FALSE;
+    }
+    static std::atomic<u32> printed{0};
+    if (printed.fetch_add(1, std::memory_order_relaxed) < 200) {
+        std::printf("Vulkan driver %s: %s\n",
+                    severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ? "error"
+                                                                                : "warning",
+                    data && data->pMessage ? data->pMessage : "<null>");
+        std::fflush(stdout);
+    }
+    return VK_FALSE;
+}
+
+vk::UniqueDebugUtilsMessengerEXT CreateDriverMessageCallback(vk::Instance instance) {
+    const vk::DebugUtilsMessengerCreateInfoEXT msg_ci = {
+        .messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eError |
+                           vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning,
+        .messageType = vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
+                       vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation |
+                       vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance,
+        .pfnUserCallback = DriverMessageCallback,
+    };
+    auto [messenger_result, messenger] = instance.createDebugUtilsMessengerEXTUnique(msg_ci);
+    if (messenger_result != vk::Result::eSuccess) {
+        std::printf("Vulkan driver messages unavailable: %s\n",
+                    vk::to_string(messenger_result).c_str());
+    }
     return std::move(messenger);
 }
 

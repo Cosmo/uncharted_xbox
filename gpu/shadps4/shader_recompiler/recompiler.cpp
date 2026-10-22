@@ -112,6 +112,10 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
                 for (u32 i = 0; i < inst.dst_count; ++i) line += " " + operand(inst.dst[i]);
                 line += " <-";
                 for (u32 i = 0; i < inst.src_count; ++i) line += " " + operand(inst.src[i]);
+                if (inst.opcode >= Gcn::Opcode::S_BRANCH &&
+                    inst.opcode <= Gcn::Opcode::S_CBRANCH_EXECNZ) {
+                    line += " -> " + std::to_string(s64(pc) + 4 + s64(inst.control.sopp.simm) * 4);
+                }
                 std::fprintf(f, "%s\n", line.c_str());
                 pc += inst.length;
             }
