@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstring>
 #include "videodec2_impl.h"
 
 #include "common/alignment.h"
@@ -24,6 +26,9 @@ VdecDecoder::VdecDecoder(const OrbisVideodec2DecoderConfigInfo& config_info,
     ASSERT(m_codec_context);
     m_codec_context->width = config_info.max_frame_width;
     m_codec_context->height = config_info.max_frame_height;
+    m_max_width = config_info.max_frame_width;
+    m_max_height = config_info.max_frame_height;
+    std::printf("Videodec2: decoder for %ux%u frames\n", m_max_width, m_max_height);
     m_codec_context->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
 
     avcodec_open2(m_codec_context, codec, nullptr);
@@ -32,6 +37,7 @@ VdecDecoder::VdecDecoder(const OrbisVideodec2DecoderConfigInfo& config_info,
 VdecDecoder::~VdecDecoder() {
     avcodec_free_context(&m_codec_context);
     sws_freeContext(m_sws_context);
+    sws_freeContext(m_fit_context);
 }
 
 s32 VdecDecoder::Decode(const OrbisVideodec2InputData& input_data,
@@ -104,17 +110,31 @@ s32 VdecDecoder::Decode(const OrbisVideodec2InputData& input_data,
         av_frame_free(&frame);
         frame = nv12_frame;
     }
+    // Linux fork: in the Steam Deck's 720p mode (scripts/render_720p.py) the game asks for
+    // 1280x720 decoders and the collection's movies are 1080p: their frames did not fit its
+    // 720p buffers (green and pink logo screens). FitToMaxSize makes them fit.
+    // The game's 720p movie textures put the chroma plane after 768 luma rows (rows aligned to
+    // 64; 1080p frames come out at 1088 rows either way).
+    u32 height_align = 16;
+    if (m_max_width && m_max_height &&
+        (u32(frame->width) > m_max_width || u32(frame->height) > m_max_height)) {
+        if (AVFrame* fitted = FitToMaxSize(*frame)) {
+            av_frame_free(&frame);
+            frame = fitted;
+            height_align = 64;
+        }
+    }
 
     const bool is_avc = m_codec_context->codec_id == AV_CODEC_ID_H264;
     const u64 info_size =
         is_avc ? sizeof(OrbisVideodec2AvcPictureInfo) : sizeof(OrbisVideodec2HevcPictureInfo);
     Videodec::CopyNV12Data((u8*)frame_buffer.frame_buffer,
-                           frame_buffer.frame_buffer_size - info_size, *frame);
+                           frame_buffer.frame_buffer_size - info_size, *frame, height_align);
     frame_buffer.is_accepted = true;
 
     const auto width = Common::AlignUp<u32>(frame->width, 16);
     const auto pitch = Common::AlignUp<u32>(frame->width, 64);
-    const auto height = Common::AlignUp<u32>(frame->height, 16);
+    const auto height = Common::AlignUp<u32>(frame->height, height_align);
 
     output_info.is_valid = true;
     output_info.is_error_frame = false;
@@ -197,17 +217,31 @@ s32 VdecDecoder::Flush(OrbisVideodec2FrameBuffer& frame_buffer,
         av_frame_free(&frame);
         frame = nv12_frame;
     }
+    // Linux fork: in the Steam Deck's 720p mode (scripts/render_720p.py) the game asks for
+    // 1280x720 decoders and the collection's movies are 1080p: their frames did not fit its
+    // 720p buffers (green and pink logo screens). FitToMaxSize makes them fit.
+    // The game's 720p movie textures put the chroma plane after 768 luma rows (rows aligned to
+    // 64; 1080p frames come out at 1088 rows either way).
+    u32 height_align = 16;
+    if (m_max_width && m_max_height &&
+        (u32(frame->width) > m_max_width || u32(frame->height) > m_max_height)) {
+        if (AVFrame* fitted = FitToMaxSize(*frame)) {
+            av_frame_free(&frame);
+            frame = fitted;
+            height_align = 64;
+        }
+    }
 
     const bool is_avc = m_codec_context->codec_id == AV_CODEC_ID_H264;
     const u64 info_size =
         is_avc ? sizeof(OrbisVideodec2AvcPictureInfo) : sizeof(OrbisVideodec2HevcPictureInfo);
     Videodec::CopyNV12Data((u8*)frame_buffer.frame_buffer,
-                           frame_buffer.frame_buffer_size - info_size, *frame);
+                           frame_buffer.frame_buffer_size - info_size, *frame, height_align);
     frame_buffer.is_accepted = true;
 
     const auto width = Common::AlignUp<u32>(frame->width, 16);
     const auto pitch = Common::AlignUp<u32>(frame->width, 64);
-    const auto height = Common::AlignUp<u32>(frame->height, 16);
+    const auto height = Common::AlignUp<u32>(frame->height, height_align);
 
     output_info.is_valid = true;
     output_info.is_error_frame = false;
@@ -263,6 +297,53 @@ s32 VdecDecoder::Flush(OrbisVideodec2FrameBuffer& frame_buffer,
 s32 VdecDecoder::Reset() {
     avcodec_flush_buffers(m_codec_context);
     return ORBIS_OK;
+}
+
+AVFrame* VdecDecoder::FitToMaxSize(AVFrame& frame) {
+    // The frame handed over has the decoder's maximum size. The collection's movie shader in its
+    // 720p mode samples the picture at 720p/1080p of each screen position from the top left
+    // (its 1080p movies were made for 1080p): the picture is scaled to that share of the frame,
+    // top left, the rest black, and comes out full screen.
+    const u32 width = m_max_width & ~1u;
+    const u32 height = m_max_height & ~1u;
+    // Rounded up to even sizes: the shader reaches 1280 * 2/3 = 853.3 (852 left a bright line
+    // at the right edge of the screen).
+    const auto share = [](u32 size, int full) {
+        const u64 span = u64(size) * size;
+        return std::min<u32>(size, u32((span + u32(full) - 1) / u32(full) + 1) & ~1u);
+    };
+    const u32 pic_width = share(width, std::max(frame.width, 1));
+    const u32 pic_height = share(height, std::max(frame.height, 1));
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::printf("Videodec2: %dx%d frames as %ux%u pictures in %ux%u frames\n", frame.width,
+                    frame.height, pic_width, pic_height, width, height);
+    }
+    AVFrame* fitted = av_frame_alloc();
+    fitted->pts = frame.pts;
+    fitted->pkt_dts = frame.pkt_dts;
+    fitted->format = AV_PIX_FMT_NV12;
+    fitted->width = int(width);
+    fitted->height = int(height);
+    fitted->sample_aspect_ratio = frame.sample_aspect_ratio;
+    fitted->opaque = frame.opaque;
+    av_frame_get_buffer(fitted, 0);
+    for (u32 y = 0; y < height; ++y) {
+        std::memset(fitted->data[0] + y * fitted->linesize[0], 16, width); // black
+    }
+    for (u32 y = 0; y < height / 2; ++y) {
+        std::memset(fitted->data[1] + y * fitted->linesize[1], 128, width);
+    }
+    m_fit_context = sws_getCachedContext(m_fit_context, frame.width, frame.height, AV_PIX_FMT_NV12,
+                                         int(pic_width), int(pic_height), AV_PIX_FMT_NV12,
+                                         SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!m_fit_context || sws_scale(m_fit_context, frame.data, frame.linesize, 0, frame.height,
+                                    fitted->data, fitted->linesize) < 0) {
+        av_frame_free(&fitted);
+        return nullptr;
+    }
+    return fitted;
 }
 
 AVFrame* VdecDecoder::ConvertNV12Frame(AVFrame& frame) {

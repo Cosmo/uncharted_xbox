@@ -585,7 +585,95 @@ Files Prepare(const Dump& dump) {
     modules.push_back(load_module(dump.fios));
     files.boot=link(load_module(dump.exe),probe,modules);
     files.content=content(values);
+    try { files.render720p=Render720p(dump.exe); }
+    catch(const std::exception& error) { files.render720p_error=error.what(); }
     return files;
+}
+
+// render_720p.py (spacepepperoni/uncharted_Linux): the collection's engine keeps its video settings in
+// one structure, set by default setups and by a mode switch whose 1080p case sets every size field
+// (scene, UI, viewport) to 1920x1080; the PS4's 720p case already exists. The defaults get the 720p
+// values (1280x720, and 160x180 in fields 0x40/0x44) and the 1080p case jumps to the 720p case. The
+// movie decoder's maximum frame size becomes 1280x720 (Videodec2 scales the 1080p movies to fit).
+// The sites are found by their instruction bytes, the same in U1, U2 and U3.
+Bytes Render720p(const Bytes& exe) {
+    const Self self=parse_self(exe);
+    const Bytes& elf=self.elf;
+    if(self.ph.empty()) fail("no program headers");
+    const uint64_t base=self.ph[0].offset-self.ph[0].vaddr;
+    const size_t size=elf.size();
+    auto u32=[&](size_t at) { uint32_t value; std::memcpy(&value,elf.data()+at,4); return value; };
+    // movl $imm32, disp8(%reg): an optional REX.B prefix, C7, ModRM mod=01 reg=0 with any base but rsp.
+    auto modrm=[](uint8_t value) { return value>=0x40&&value<0x48&&value!=0x44; };
+    auto movl=[&](size_t at,uint8_t disp,uint32_t imm) -> size_t {
+        const size_t op=at<size&&elf[at]==0x41 ? at+1 : at;
+        if(op+7>size||elf[op]!=0xc7||!modrm(elf[op+1])||elf[op+2]!=disp||u32(op+3)!=imm) return 0;
+        return op+7-at;
+    };
+    // movl $1920, 0x8(%reg); movl $1080, 0xc(%reg): the first two size fields of a setup.
+    std::vector<size_t> sites;
+    for(size_t at=0;at<size;) {
+        const size_t first=movl(at,0x08,1920),second=first ? movl(at+first,0x0c,1080) : 0;
+        if(second) { sites.push_back(at); at+=first+second; } else ++at;
+    }
+    constexpr size_t max_sites=3,window=0x90;
+    if(sites.empty()||sites.size()>max_sites)
+        fail("expected 1 to 3 video setting sites, found "+std::to_string(sites.size()));
+    std::vector<std::pair<uint64_t,Bytes>> writes;
+    auto write32=[&](size_t at,uint32_t value) {
+        Bytes data(4); std::memcpy(data.data(),&value,4); writes.push_back({at-base,data});
+    };
+    for(size_t index=0;index<sites.size();++index) {
+        const size_t site=sites[index];
+        const size_t end=std::min(site+window,index+1<sites.size() ? sites[index+1]-9 : size);
+        // cmp $1, %reg32; jne <next mode>: the mode switch's 1080p case jumps to the 720p case.
+        if(site>=9&&elf[site-9]==0x83&&elf[site-8]>=0xf8&&elf[site-7]==0x01&&elf[site-6]==0x0f&&elf[site-5]==0x85) {
+            int32_t rel; std::memcpy(&rel,elf.data()+site-4,4);
+            ++rel;  // jmp rel32 is one byte shorter
+            Bytes data{0xe9,0,0,0,0,0x90}; std::memcpy(data.data()+1,&rel,4);
+            writes.push_back({site-6-base,data});
+            continue;
+        }
+        for(size_t at=site;at<end&&at+4<=size;++at) {
+            const uint32_t value=u32(at);
+            uint32_t replacement;
+            if(value==1920) replacement=1280;
+            else if(value==1080) replacement=720;
+            else if(value==1920/8) replacement=1280/8;
+            else if(value==1080/4) replacement=720/4;
+            else continue;
+            // movl $imm32, disp8(%reg), or either half of movabs $imm64, %rax
+            const bool is_movl=at>=3&&elf[at-3]==0xc7&&modrm(elf[at-2]);
+            const bool is_movabs=(at>=2&&elf[at-2]==0x48&&elf[at-1]==0xb8)||(at>=6&&elf[at-6]==0x48&&elf[at-5]==0xb8);
+            // 1920/8 and 1080/4 only in fields 0x40/0x44 (the 1080p mode's 240x270)
+            if((value==1920/8||value==1080/4)&&!(is_movl&&(elf[at-1]==0x40||elf[at-1]==0x44))) continue;
+            if(is_movl||is_movabs) write32(at,replacement);
+        }
+    }
+    // movl $1920, d(%rsp); movl $1088, d+4(%rsp): the movie decoder's maximum frame size.
+    std::vector<size_t> decoders;
+    static constexpr uint8_t width_bytes[]={0x80,0x07,0x00,0x00},height_bytes[]={0x40,0x04,0x00,0x00};
+    for(size_t at=0;at+16<=size;) {
+        const uint8_t* p=elf.data()+at;
+        if(p[0]==0xc7&&p[1]==0x44&&p[2]==0x24&&!std::memcmp(p+4,width_bytes,4)&&
+           p[8]==0xc7&&p[9]==0x44&&p[10]==0x24&&!std::memcmp(p+12,height_bytes,4)) {
+            if(int(p[11])==int(p[3])+4) decoders.push_back(at);
+            at+=16;
+        } else ++at;
+    }
+    if(decoders.size()!=1) fail("expected one movie decoder setup, found "+std::to_string(decoders.size()));
+    write32(decoders[0]+4,1280);
+    write32(decoders[0]+12,720);
+    Bytes out;
+    put_text(out,"BBPATCH2",8);
+    put<uint64_t>(out,0x400000);
+    put<uint64_t>(out,writes.size());
+    for(const auto& [offset,data]:writes) {
+        put<uint64_t>(out,offset);
+        put<uint64_t>(out,data.size());
+        out.insert(out.end(),data.begin(),data.end());
+    }
+    return out;
 }
 
 uint64_t Fingerprint(const Dump& dump) {

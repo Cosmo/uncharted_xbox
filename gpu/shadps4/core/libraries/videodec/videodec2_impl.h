@@ -28,10 +28,15 @@ public:
 
 private:
     AVFrame* ConvertNV12Frame(AVFrame& frame);
+    /// Linux fork: a frame larger than the decoder's configured maximum, scaled down to fit it.
+    AVFrame* FitToMaxSize(AVFrame& frame);
 
 private:
     AVCodecContext* m_codec_context = nullptr;
     SwsContext* m_sws_context = nullptr;
+    SwsContext* m_fit_context = nullptr;
+    u32 m_max_width = 0;
+    u32 m_max_height = 0;
 };
 
 } // namespace Libraries::Videodec2

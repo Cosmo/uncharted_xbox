@@ -426,6 +426,10 @@ static bool prepare_game(std::string const& dump,std::string const& exe,std::str
     for(auto const& [name,data]:written) {
         if(!write_file(prepared+"\\"+name,*data)) { stop(std::string("Writing the prepared game file ")+name+" failed.",player); return false; }
     }
+    // The 720p mode's patches: without them the game runs at 1080p.
+    DeleteFileFromAppW(winrt::to_hstring(prepared+"\\render720p.bin").c_str());
+    if(result.render720p.empty()) std::printf("720p mode unavailable: %s\n",result.render720p_error.c_str());
+    else if(!write_file(prepared+"\\render720p.bin",result.render720p)) std::puts("Writing render720p.bin failed: the game runs at 1080p");
     if(!write_file(prepared+"\\format.txt",UnchartedPrepare::Bytes(marker.begin(),marker.end()))) {
         stop("Writing the prepared game files failed.",player); return false;
     }
@@ -519,7 +523,7 @@ static void loader() {
            key=="BB_PIPELINE_BINARIES"||key=="BB_FRAMES_AHEAD"||key=="BB_STREAM_MEMORY"||
            key=="BB_RECORDER_TIMINGS"||key=="BB_BAKED_PIPELINES"||
            key=="BB_PERF_DIAG"||key=="BB_PREP_WORKERS"||key=="BB_COPY_THREADS"||key=="BB_CHOOSE_DUMP"||
-           key=="BB_READ_FAULT_EVERY") {
+           key=="BB_READ_FAULT_EVERY"||key=="BB_RENDER_720P"||key=="BB_DRED"||key=="BB_GPU_CHECKPOINTS"||key=="BB_SKIP_SHADERS"||key=="BB_GPU_CHECKPOINTS_FROM"||key=="BB_DUMP_GCN") {
             _putenv_s(key.c_str(),value.c_str());
             SetEnvironmentVariableW(winrt::to_hstring(key).c_str(),winrt::to_hstring(value).c_str());
         }
@@ -697,6 +701,13 @@ static void loader() {
 #endif
     arguments.insert(arguments.end(),{"--content-profile",content,"--app0",dump,"--user",user,"--timeout","0"});
     if(!guest_argv.empty()) arguments.insert(arguments.end(),{"--guest-argv",guest_argv});
+    // The game renders at 1280x720 (menus and movies too) unless BB_RENDER_720P=0 (graphics-debug.txt).
+    const std::string render720p=prepared+"\\render720p.bin";
+    const char* render720p_setting=std::getenv("BB_RENDER_720P");
+    const bool use720p=!(render720p_setting&&*render720p_setting=='0')&&
+        GetFileAttributesW(winrt::to_hstring(render720p).c_str())!=INVALID_FILE_ATTRIBUTES;
+    if(use720p) arguments.insert(arguments.end(),{"--patches",render720p});
+    std::printf("Render resolution: %s\n",use720p ? "1280x720" : "1920x1080");
     if(mode=="imports") arguments.push_back("--list-missing");
     std::vector<char*> args;
     for(auto& argument:arguments) args.push_back(argument.data());

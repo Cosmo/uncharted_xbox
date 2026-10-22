@@ -16,6 +16,9 @@ Developer Mode from the player's own dump. It contains no game code or game asse
   packaging this app ports. GPL-2.0.
 - **shadPS4** (https://github.com/shadps4-emu/shadPS4): the PS4 graphics emulation, its shader
   recompiler and Vulkan renderer (`gpu/shadps4`). GPL-2.0.
+- **uncharted_Linux** by spacepepperoni (https://github.com/spacepepperoni/uncharted_Linux): the
+  720p mode (its Steam Deck mode: `scripts/render_720p.py`, rewritten in C++ in
+  `platform/prepare_game.cpp`) and the movie decoder's scaling to the 720p frames. GPL-2.0.
 - **KytyPS5 for Xbox** (https://github.com/Cosmo/KytyPS5): the Xbox memory pager, the
   performance overlay and the Back-button handling follow its Xbox port. GPL-2.0.
 - **Mesa / Dozen**, Vulkan on Direct3D 12, from the fork
