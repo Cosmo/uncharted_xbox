@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include "bbport_copy.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -111,6 +112,13 @@ struct PageManager::Impl {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         // bbport: the draw recording thread handles its faults inline too (vk_draw_pipe.h).
         const auto is_gpu_thread = rasterizer->IsGpuSideThread();
+        // bbport: a copy thread must not wait for the GPU thread to read GPU-written memory
+        // back: the draw recording thread may be waiting for that copy, the GPU thread for it
+        // (a hang when a level starts). Under its recovery point the copy stops here instead, and
+        // a GPU-side thread runs it again (BbCopy::RunDeferred), handling the fault inline.
+        if (!is_gpu_thread && BbCopy::InCopyThread() && runtime_fault_recover) {
+            return false;
+        }
         if (is_gpu_thread) {
             BbStats::gpu_signal_faults.fetch_add(1, std::memory_order_relaxed);
         }
