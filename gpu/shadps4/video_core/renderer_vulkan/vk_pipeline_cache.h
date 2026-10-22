@@ -161,6 +161,10 @@ public:
     }
 
 private:
+    /// bbport (Xbox): the driver's pipeline cache is kept beside the pipeline keys. Dozen stores the
+    /// DXIL of every pipeline in it, so a warm-up only creates the D3D12 pipeline states again.
+    void LoadDriverCache();
+    void SaveDriverCache();
     bool RefreshGraphicsKey(PipelineSelection& sel);
     bool RefreshGraphicsStages(PipelineSelection& sel);
     bool RefreshComputeKey();
@@ -188,6 +192,7 @@ private:
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
+    size_t driver_cache_size = 0; ///< pipeline_cache data size when last loaded or saved
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     /// bbport: exclusive for program/permutation insertions, shared for worker lookups.
     std::shared_mutex programs_mutex;

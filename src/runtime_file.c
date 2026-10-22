@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 #ifdef _WIN32
 #include <windows.h>
 /* 64-bit sizes and times; directories are never opened as CRT descriptors. */
@@ -54,6 +55,52 @@ static Mount mounts[MAX_MOUNTS];
 static size_t mount_count, opens, reads, writes, missing;
 static uint64_t bytes_read;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+
+/* Opt-in diagnostics: separate time in the host read from guest-page copying.
+ * Totals may overlap across threads; they are not a frame-time decomposition. */
+static uint64_t io_calls,io_bytes,io_small,io_host_calls,io_host_small;
+static uint64_t io_total_ns,io_host_ns,io_copy_ns,io_mapping_ns,io_max_ns,io_host_max_ns;
+static int io_profile_enabled(void) {
+    static int state;
+    int enabled=__atomic_load_n(&state,__ATOMIC_RELAXED);
+    if(!enabled) {
+        const char *value=getenv("BB_IO_STATS");
+        enabled=value&&*value=='1' ? 2 : 1;
+        __atomic_store_n(&state,enabled,__ATOMIC_RELAXED);
+    }
+    return enabled==2;
+}
+static uint64_t io_now(void) {
+    if(!io_profile_enabled()) return 0;
+    struct timespec time;
+    clock_gettime(CLOCK_MONOTONIC,&time);
+    return (uint64_t)time.tv_sec*UINT64_C(1000000000)+(uint64_t)time.tv_nsec;
+}
+static void io_max(uint64_t *counter,uint64_t value) {
+    uint64_t old=__atomic_load_n(counter,__ATOMIC_RELAXED);
+    while(old<value&&!__atomic_compare_exchange_n(counter,&old,value,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+}
+static void io_finished(uint64_t start,uint64_t requested,int64_t result) {
+    if(!start) return;
+    const uint64_t elapsed=io_now()-start;
+    __atomic_add_fetch(&io_calls,1,__ATOMIC_RELAXED);
+    if(result>0) __atomic_add_fetch(&io_bytes,(uint64_t)result,__ATOMIC_RELAXED);
+    if(requested<=4096) __atomic_add_fetch(&io_small,1,__ATOMIC_RELAXED);
+    __atomic_add_fetch(&io_total_ns,elapsed,__ATOMIC_RELAXED);
+    io_max(&io_max_ns,elapsed);
+}
+void runtime_file_profile_report(void) {
+    if(!io_profile_enabled()) return;
+#define IO_TAKE(value) __atomic_exchange_n(&(value),0,__ATOMIC_RELAXED)
+    const uint64_t calls=IO_TAKE(io_calls),bytes=IO_TAKE(io_bytes),small=IO_TAKE(io_small);
+    const uint64_t host_calls=IO_TAKE(io_host_calls),host_small=IO_TAKE(io_host_small);
+    const uint64_t total=IO_TAKE(io_total_ns),host=IO_TAKE(io_host_ns),copy=IO_TAKE(io_copy_ns),mapping=IO_TAKE(io_mapping_ns);
+    const uint64_t peak=IO_TAKE(io_max_ns),host_peak=IO_TAKE(io_host_max_ns);
+    printf("IO profile: t=%.3f reads=%llu bytes=%llu small4K=%llu host_reads=%llu host_small4K=%llu total=%.3f host=%.3f copy=%.3f mapping=%.3f max=%.3f host_max=%.3f ms\n",
+        io_now()/1e9,(unsigned long long)calls,(unsigned long long)bytes,(unsigned long long)small,
+        (unsigned long long)host_calls,(unsigned long long)host_small,total/1e6,host/1e6,copy/1e6,mapping/1e6,peak/1e6,host_peak/1e6);
+#undef IO_TAKE
+}
 
 int runtime_file_mount(const char *guest,const char *host) {
     pthread_mutex_lock(&lock);
@@ -298,6 +345,20 @@ static ssize_t host_write(int h,const void *buffer,uint64_t size) { return write
 #define host_read read
 #define host_write write
 #endif
+static ssize_t measured_read(int handle,void *buffer,uint64_t size,int64_t offset,int positioned) {
+    const uint64_t start=io_now();
+    const ssize_t result=positioned ? pread(handle,buffer,size,offset) : host_read(handle,buffer,size);
+    const int error=errno;
+    if(start) {
+        const uint64_t elapsed=io_now()-start;
+        __atomic_add_fetch(&io_host_calls,1,__ATOMIC_RELAXED);
+        if(size<=4096) __atomic_add_fetch(&io_host_small,1,__ATOMIC_RELAXED);
+        __atomic_add_fetch(&io_host_ns,elapsed,__ATOMIC_RELAXED);
+        io_max(&io_host_max_ns,elapsed);
+    }
+    errno=error;
+    return result;
+}
 /* Pages of the destination may be write-protected for GPU tracking: the kernel's copy then
  * fails with EFAULT instead of faulting to our handler. A user-mode write to each page first
  * goes through the handler, which unprotects it (and records the upcoming write). */
@@ -309,6 +370,59 @@ static void touch_for_write(void *buffer,uint64_t size) {
         *b=*b;
     }
 }
+#ifdef UNCHARTED_UWP
+static int mapped_io_buffer(void *buffer,uint64_t size) {
+    const uint64_t start=io_now();
+    const int mapped=runtime_memory_is_mapped((uintptr_t)buffer,size);
+    if(start) __atomic_add_fetch(&io_mapping_ns,io_now()-start,__ATOMIC_RELAXED);
+    return mapped;
+}
+/* The kernel does not fault our pages back in. Copies through a bounded host
+ * buffer do, and cannot race a pager unmapping a buffer during kernel I/O. */
+static ssize_t paged_io(int handle,void *buffer,uint64_t size,int64_t offset,int positioned,int writing) {
+    if(size>0x7ffff000) size=0x7ffff000;
+    size_t capacity=(size_t)(size>(UINT64_C(1)<<20) ? (UINT64_C(1)<<20) : size);
+    if(!capacity) return 0;
+    unsigned char *bounce=malloc(capacity);
+    if(!bounce) { errno=ENOMEM; return -1; }
+    uint64_t total=0;
+    int error=0;
+    while(total<size) {
+        size_t count=(size_t)(size-total<capacity ? size-total : capacity);
+        if(writing) memcpy(bounce,(const unsigned char *)buffer+total,count);
+        ssize_t n=writing ? (positioned ? pwrite(handle,bounce,count,offset+(int64_t)total) : host_write(handle,bounce,count))
+                          : measured_read(handle,bounce,count,offset+(int64_t)total,positioned);
+        if(n<0) { error=errno; break; }
+        if(!n) break;
+        if(!writing) {
+            const uint64_t start=io_now();
+            memcpy((unsigned char *)buffer+total,bounce,(size_t)n);
+            if(start) __atomic_add_fetch(&io_copy_ns,io_now()-start,__ATOMIC_RELAXED);
+        }
+        total+=(uint64_t)n;
+        if((size_t)n<count) break;
+    }
+    free(bounce);
+    if(!total&&error) { errno=error; return -1; }
+    return (ssize_t)total;
+}
+int runtime_file_paged_selftest(void *buffer,uint64_t size) {
+    const char *root=getenv("BB_GPU_USER_DIR");
+    if(!root) return 1;
+    char path[4096];
+    snprintf(path,sizeof(path),"%s/bbport-pager-io-selftest.bin",root);
+    FILE *file=fopen(path,"w+b");
+    if(!file) return 2;
+    int fd=fileno(file),result=0;
+    if(paged_io(fd,buffer,size,0,1,1)!=(ssize_t)size) result=3;
+    if(!result) {
+        memset(buffer,0,(size_t)size);
+        if(paged_io(fd,buffer,size,0,1,0)!=(ssize_t)size) result=4;
+    }
+    fclose(file); remove(path);
+    return result;
+}
+#endif
 /* The GPU side can write-protect a destination page again between touch_for_write and the read;
  * the host then stops short (Windows: no error, fewer bytes) and a short read the guest takes as
  * complete loses data (U2's script module: 16384 of 392775 bytes, issue #101; streamed level
@@ -318,9 +432,13 @@ static ssize_t read_full(int h,void *buffer,uint64_t size,int64_t offset) {
     unsigned char *at=buffer;
     uint64_t done=0;
     int retries=0;
+#ifdef UNCHARTED_UWP
+    /* Pageable guest memory goes through a host buffer, which no GPU tracking protects. */
+    if (mapped_io_buffer(buffer,size)) return paged_io(h,buffer,size,offset<0 ? 0 : offset,offset>=0,0);
+#endif
     while (done<size) {
         touch_for_write(at+done,size-done);
-        ssize_t n=offset<0 ? host_read(h,at+done,size-done) : pread(h,at+done,size-done,offset+(int64_t)done);
+        ssize_t n=measured_read(h,at+done,size-done,offset<0 ? 0 : offset+(int64_t)done,offset>=0);
         if (n>0) { done+=(uint64_t)n; retries=0; if (h<3) break; continue; }
         if (n==0) break;
         if (++retries>8) { if (done) break; return -1; }
@@ -330,7 +448,13 @@ static ssize_t read_full(int h,void *buffer,uint64_t size,int64_t offset) {
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    const uint64_t start=io_now();
+    runtime_wait_begin("file read",fd>=3 && fd<MAX_FILES ? files[fd].path : NULL,NULL,NULL,0);
     ssize_t n=read_full(h,buffer,size,-1);
+    runtime_wait_end();
+    const int error=errno;
+    io_finished(start,size,n);
+    errno=error;
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     trace_bank_read(fd,size,-1,n);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -339,7 +463,13 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    const uint64_t start=io_now();
+    runtime_wait_begin("file read",fd>=3 && fd<MAX_FILES ? files[fd].path : NULL,NULL,NULL,0);
     ssize_t n=read_full(h,buffer,size,offset);
+    runtime_wait_end();
+    const int error=errno;
+    io_finished(start,size,n);
+    errno=error;
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     trace_bank_read(fd,size,offset,n);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -348,7 +478,12 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    ssize_t n=host_write(h,buffer,size);
+    ssize_t n;
+#ifdef UNCHARTED_UWP
+    if(runtime_memory_is_mapped((uintptr_t)buffer,size)) n=paged_io(h,(void *)buffer,size,0,0,1);
+    else
+#endif
+    n=host_write(h,buffer,size);
     if (n<0) return -errno;
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);
     return n;
@@ -356,7 +491,12 @@ static int64_t do_write(int fd,const void *buffer,uint64_t size) {
 static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    ssize_t n=pwrite(h,buffer,size,offset);
+    ssize_t n;
+#ifdef UNCHARTED_UWP
+    if(runtime_memory_is_mapped((uintptr_t)buffer,size)) n=paged_io(h,(void *)buffer,size,offset,1,1);
+    else
+#endif
+    n=pwrite(h,buffer,size,offset);
     return n<0 ? -errno : n;
 }
 static int64_t do_lseek(int fd,int64_t offset,int whence) {

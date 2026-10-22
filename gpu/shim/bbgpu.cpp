@@ -212,6 +212,10 @@ static void StartProfileWriter() {
 #endif
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
+    // UWP reads its private settings after CRT initialization. Refresh diagnostics before
+    // creating renderer threads; the startup environment alone can miss those overrides.
+    const char* frame_stats = std::getenv("BB_FRAME_STATS");
+    BbStats::enabled = frame_stats && frame_stats[0] == '1';
     BbSettings::Load();
 #ifdef BB_PGO_GENERATE
     StartProfileWriter();
@@ -263,14 +267,18 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
 }
 
 namespace Libraries::Kernel { void StartKernelService(); }
+#ifndef UNCHARTED_UWP // online play is desktop only (gpu/CMakeLists.txt)
 extern "C" void bbnet_register(void); // bbnet/bbnet_glue.cpp: network and PSN (co-op)
+#endif
 extern "C" void bbgpu_register_kernel(void) {
     Libraries::Kernel::StartKernelService();
     Core::Loader::SymbolsResolver resolver;
     Libraries::Kernel::RegisterEventQueue(&resolver);
     Libraries::AvPlayer::RegisterLib(&resolver);
     Libraries::Videodec2::RegisterLib(&resolver);
+#ifndef UNCHARTED_UWP
     bbnet_register();
+#endif
 }
 
 extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {

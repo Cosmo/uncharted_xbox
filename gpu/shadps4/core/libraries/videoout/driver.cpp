@@ -327,11 +327,43 @@ void VideoOutDriver::Flip(const Request& req) {
         static u64 last_proc_flt, last_copy_ns, last_copy_bytes, last_rf, last_trf, last_twf;
         const u64 rf = BbStats::read_faults.load(), trf = BbStats::t_read_faults.load(),
                   twf = BbStats::t_write_faults.load();
-        if (frame_ms > 40.0 && last_gpu_ns != 0) {
-            std::printf("       fault handlers: %llu read faults %.1f ms, write faults %.1f ms\n",
-                        static_cast<unsigned long long>(rf - last_rf), (trf - last_trf) / 1e6,
-                        (twf - last_twf) / 1e6);
+        // bbport: every frame over 40 ms (BB_STALL_MS) after the first, at most 10 per 5 s window.
+        static const double stall_ms = [] {
+            const char* value = std::getenv("BB_STALL_MS");
+            return value ? std::atof(value) : 40.0;
+        }();
+        static bool primed = false;
+        static u32 stalls_shown = 0;
+        const bool stall = primed && frame_ms > stall_ms && stalls_shown < 10;
+        stalls_shown += stall;
+        primed = true;
+        // Waits and work inside the long frame (window counters are reset every 5 s, so the
+        // previous values are reset with them).
+        static u64 last_wait[7];
+        const u64 wait_now[7] = {BbStats::t_readback_wait.load(), BbStats::tick_wait_ns.load(),
+                                 BbStats::sync_recording_ns.load(), BbStats::host_copies_wait_ns.load(),
+                                 u64(Vulkan::g_bb_compile_ns.load()), u64(Vulkan::g_bb_compiles.load()),
+                                 BbStats::t_gc.load()};
+        if (stall) {
+            std::printf("Stall: %.1f ms frame; waits: readback %.1f ms, GPU ticks %.1f ms, "
+                        "recorder %.1f ms, host copies %.1f ms; %llu compiles %.1f ms; GC %.1f ms\n",
+                        frame_ms, (wait_now[0] - last_wait[0]) / 1e6, (wait_now[1] - last_wait[1]) / 1e6,
+                        (wait_now[2] - last_wait[2]) / 1e6, (wait_now[3] - last_wait[3]) / 1e6,
+                        static_cast<unsigned long long>(wait_now[5] - last_wait[5]),
+                        (wait_now[4] - last_wait[4]) / 1e6, (wait_now[6] - last_wait[6]) / 1e6);
         }
+        std::copy(std::begin(wait_now), std::end(wait_now), std::begin(last_wait));
+        static u64 last_inv[3];
+        const u64 inv[3] = {BbStats::t_inv_readbacks.load(), BbStats::t_inv_buffers.load(),
+                            BbStats::t_inv_textures.load()};
+        if (stall) {
+            std::printf("       fault handlers: %llu read faults %.1f ms, write faults %.1f ms; "
+                        "invalidation: readbacks %.1f ms, buffers %.1f ms, textures %.1f ms\n",
+                        static_cast<unsigned long long>(rf - last_rf), (trf - last_trf) / 1e6,
+                        (twf - last_twf) / 1e6, (inv[0] - last_inv[0]) / 1e6,
+                        (inv[1] - last_inv[1]) / 1e6, (inv[2] - last_inv[2]) / 1e6);
+        }
+        std::copy(std::begin(inv), std::end(inv), std::begin(last_inv));
         last_rf = rf;
         last_trf = trf;
         last_twf = twf;
@@ -351,11 +383,13 @@ void VideoOutDriver::Flip(const Request& req) {
                   user_us = BbStats::gpu_user_us.load(), invol = BbStats::gpu_invol_switches.load(),
                   vol = BbStats::gpu_vol_switches.load();
         u64 gpu_ns = 0;
+#ifndef UNCHARTED_UWP // no per-thread clocks there; the thread report (BbThreads) has the CPU time
         if (const int clock = BbStats::gpu_thread_clock.load(); clock != -1) {
             timespec ts{};
             clock_gettime(static_cast<clockid_t>(clock), &ts);
             gpu_ns = u64(ts.tv_sec) * 1000000000ull + u64(ts.tv_nsec);
         }
+#endif
         const u64 images = BbStats::images_registered.load();
         const u64 image_bytes = BbStats::image_upload_bytes.load();
         const u64 buffer_bytes = BbStats::buffer_upload_bytes.load();
@@ -481,10 +515,17 @@ void VideoOutDriver::Flip(const Request& req) {
                     spikes += ms > 1.5 * median;
                 }
                 const double mean = sum / intervals.size();
+                // Flip intervals in vblank-sized bins (judder: a late flip and an early one).
+                u32 bins[5]{};
+                for (const double ms : intervals) {
+                    ++bins[ms < 8.0 ? 0 : ms < 25.0 ? 1 : ms < 41.7 ? 2 : ms < 58.3 ? 3 : 4];
+                }
                 std::printf("Frame pacing: median %.2f ms, stddev %.2f ms, p99 %.2f ms, "
-                            "%u frames over 1.5x median\n",
+                            "%u frames over 1.5x median; intervals <8 ms %u, ~1 vblank %u, "
+                            "~2 %u, ~3 %u, more %u\n",
                             median, std::sqrt(std::max(0.0, sq / intervals.size() - mean * mean)),
-                            sorted[std::min(sorted.size() - 1, sorted.size() * 99 / 100)], spikes);
+                            sorted[std::min(sorted.size() - 1, sorted.size() * 99 / 100)], spikes,
+                            bins[0], bins[1], bins[2], bins[3], bins[4]);
             }
             intervals.clear();
             window_start = now;
@@ -707,6 +748,24 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     while (!token.stop_requested()) {
         timer.Start();
         const auto tick_deadline = std::chrono::steady_clock::now() + vblank_period;
+        // bbport (BB_FRAME_STATS): spread of the vblank ticks themselves.
+        static const bool tick_stats = std::getenv("BB_FRAME_STATS") != nullptr;
+        if (tick_stats) {
+            static auto last_tick = std::chrono::steady_clock::now();
+            static auto report = last_tick;
+            static std::vector<double> ticks;
+            const auto tick = std::chrono::steady_clock::now();
+            ticks.push_back(std::chrono::duration<double, std::milli>(tick - last_tick).count());
+            last_tick = tick;
+            if (tick - report >= std::chrono::seconds(5) && ticks.size() > 2) {
+                std::sort(ticks.begin(), ticks.end());
+                std::printf("Vblank ticks: %zu, min %.2f ms, median %.2f ms, p99 %.2f ms, max %.2f ms\n",
+                            ticks.size(), ticks.front(), ticks[ticks.size() / 2],
+                            ticks[ticks.size() * 99 / 100], ticks.back());
+                ticks.clear();
+                report = tick;
+            }
+        }
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();

@@ -9,7 +9,7 @@
 #include <cpuid.h>
 #include "runtime.h"
 #include "gpu/bbgpu.h"
-#if !defined(__x86_64__) || !defined(__GNUC__)
+#if (!defined(__x86_64__) && !defined(_M_X64)) || (!defined(__GNUC__) && !defined(__clang__))
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
 #endif
 #ifdef _WIN32
@@ -40,7 +40,7 @@ static int entered_game;
 static int gpu_enabled;
 int vulkan_smoke(void);
 
-static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
+static _Noreturn void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
 static uint64_t read64(FILE *f) {
     unsigned char b[8];
     if (fread(b, 1, 8, f) != 8) fail("truncated boot file");
@@ -211,6 +211,71 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
     }
     snprintf(out,size,"%p",(void *)address);
 }
+#ifdef UNCHARTED_UWP
+#include <tlhelp32.h>
+/* Where the host threads are right now (thread report, LocalState\threads.txt): each is paused (the GPU threads
+ * three times, 100 ms apart, the others once) and its stack unwound while paused; it runs again before anything is
+ * printed. A thread that spins shows the same frames each time; a blocked one shows what it waits in. */
+void runtime_sample_threads(void) {
+    static const char *const wanted[]={"bbport:DrawRec","shadPS4:GpuCommandProcessor","bbport:VkRecorder"};
+    HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    if (snap==INVALID_HANDLE_VALUE) { printf("Thread samples: no thread list (%lu)\n",GetLastError()); return; }
+    THREADENTRY32 entry={.dwSize=sizeof(entry)};
+    const DWORD pid=GetCurrentProcessId(), self=GetCurrentThreadId();
+    for (BOOL ok=Thread32First(snap,&entry);ok;ok=Thread32Next(snap,&entry)) {
+        if (entry.th32OwnerProcessID!=pid || entry.th32ThreadID==self) continue;
+        HANDLE h=OpenThread(THREAD_QUERY_LIMITED_INFORMATION|THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT,FALSE,entry.th32ThreadID);
+        if (!h) continue;
+        char name[64]="";
+        PWSTR wide=NULL;
+        if (SUCCEEDED(GetThreadDescription(h,&wide)) && wide) {
+            WideCharToMultiByte(CP_UTF8,0,wide,-1,name,sizeof(name),NULL,NULL);
+            LocalFree(wide);
+        }
+        int match=0;
+        for (size_t i=0;i<sizeof(wanted)/sizeof(*wanted);++i) match|=!strcmp(name,wanted[i]);
+        if (!name[0]) snprintf(name,sizeof(name),"tid %lu",entry.th32ThreadID);
+        for (int sample=0;sample<(match ? 3 : 1);++sample) {
+            DWORD64 frames[16];
+            unsigned count=0;
+            if (SuspendThread(h)==(DWORD)-1) { printf("Thread samples: %s cannot be paused (%lu)\n",name,GetLastError()); break; }
+            _Alignas(16) CONTEXT c;
+            memset(&c,0,sizeof(c));
+            c.ContextFlags=CONTEXT_FULL;
+            if (GetThreadContext(h,&c)) {
+                for (;count<16 && c.Rip;++count) {
+                    frames[count]=c.Rip;
+                    DWORD64 base=0,establisher=0,previous=c.Rsp;
+                    void *handler_data=NULL;
+                    PRUNTIME_FUNCTION function=RtlLookupFunctionEntry(c.Rip,&base,NULL);
+                    if (function) RtlVirtualUnwind(UNW_FLAG_NHANDLER,base,c.Rip,function,&c,&handler_data,&establisher,NULL);
+                    else {
+                        SIZE_T got=0;
+                        if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)c.Rsp,&c.Rip,sizeof(c.Rip),&got) || got!=sizeof(c.Rip)) { ++count; break; }
+                        c.Rsp+=sizeof(c.Rip);
+                    }
+                    if (c.Rsp<=previous) { ++count; break; }
+                }
+            } else count=0;
+            const DWORD context_error=count ? 0 : GetLastError();
+            ResumeThread(h);
+            if (!count) { printf("Thread samples: %s context not readable (%lu)\n",name,context_error); break; }
+            char line[1600];
+            size_t used=0;
+            for (unsigned i=0;i<count && used+80<sizeof(line);++i) {
+                char where[160];
+                describe_address(where,sizeof(where),(uintptr_t)frames[i]);
+                used+=(size_t)snprintf(line+used,sizeof(line)-used,"%s%s",i ? " < " : "",where);
+            }
+            printf("Thread sample %s #%d: %s\n",name,sample+1,line);
+            if (match) Sleep(100);
+        }
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+    fflush(stdout);
+}
+#endif
 static int fatal_reported;
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     if (__atomic_exchange_n(&fatal_reported,1,__ATOMIC_ACQ_REL)) { Sleep(INFINITE); }
@@ -227,6 +292,32 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
     if (gpu_enabled) bbgpu_dump_guest_writes(info);
+    uintptr_t stack_return=0;
+    SIZE_T stack_bytes=0;
+    if(ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)c->Rsp,&stack_return,sizeof(stack_return),&stack_bytes)&&stack_bytes==sizeof(stack_return)) {
+        describe_address(where,sizeof(where),stack_return);
+        fprintf(stderr,"  stack return: %s\n",where);
+    }
+#ifdef UNCHARTED_UWP
+    CONTEXT unwind=*c;
+    for(unsigned depth=0;depth<24&&unwind.Rip;++depth) {
+        DWORD64 base=0,establisher=0;
+        void *handler_data=NULL;
+        PRUNTIME_FUNCTION function=RtlLookupFunctionEntry(unwind.Rip,&base,NULL);
+        DWORD64 previous_stack=unwind.Rsp;
+        if(function) RtlVirtualUnwind(UNW_FLAG_NHANDLER,base,unwind.Rip,function,&unwind,
+                                     &handler_data,&establisher,NULL);
+        else {
+            SIZE_T got=0;
+            if(!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)unwind.Rsp,
+                                  &unwind.Rip,sizeof(unwind.Rip),&got)||got!=sizeof(unwind.Rip)) break;
+            unwind.Rsp+=sizeof(unwind.Rip);
+        }
+        if(unwind.Rsp<=previous_stack) break;
+        describe_address(where,sizeof(where),(uintptr_t)unwind.Rip);
+        fprintf(stderr,"  native #%u %s\n",depth,where);
+    }
+#endif
     /* rbp chain (guest and host code keep frame pointers). */
     uintptr_t rbp=(uintptr_t)c->Rbp;
     for (int depth=0; depth<24 && rbp; ++depth) {
@@ -308,7 +399,16 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
-        /* GPU page tracking (write-protected guest pages) is resolved first. */
+#ifdef UNCHARTED_UWP
+        /* A reserved UWP page must exist before GPU tracking can resolve its access.
+         * Otherwise a successful GPU write-fault handler retries the untouched page. */
+        uintptr_t fault_pc=(uintptr_t)info->ContextRecord->Rip;
+        int guest_code=image && fault_pc-(uintptr_t)image<0x20000000;
+        for(uint64_t m=0;m<module_count&&!guest_code;++m)
+            guest_code=fault_pc>=modules[m].base && fault_pc-modules[m].base<modules[m].size;
+        if (runtime_memory_handle_commit_fault_at((uintptr_t)record->ExceptionInformation[1],(int)record->ExceptionInformation[0],guest_code)) return EXCEPTION_CONTINUE_EXECUTION;
+#endif
+        /* GPU page tracking resolves protection faults on committed guest pages. */
         if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
         if (runtime_fault_recover) {
             /* A speculative guest memory read (GPU draw preparation) faulted: the thread resumes
@@ -787,7 +887,10 @@ static void patch_eop_tick_wait(uint64_t image_size) {
  * released before the new process opens its own. */
 void runtime_restart(void) {
     fflush(NULL);
-#ifdef _WIN32
+#ifdef UNCHARTED_UWP
+    fputs("STOP: restart is not available in the UWP loader milestone\n",stderr);
+    _exit(21);
+#elif defined(_WIN32)
     /* run.py sets BB_RESTART_COMMAND: the launch command line, started again (new patches). */
     const char *command=getenv("BB_RESTART_COMMAND");
     puts("Runtime: restarting through run.py");
@@ -813,8 +916,18 @@ void runtime_restart(void) {
 #endif
 }
 
+#ifdef UNCHARTED_UWP
+int uncharted_probe_main(int argc, char **argv) {
+#else
 int main(int argc, char **argv) {
+#endif
     setvbuf(stdout, NULL, _IONBF, 0);
+#ifdef UNCHARTED_UWP
+    if (argc==2 && !strcmp(argv[1],"--memory-selftest")) {
+        AddVectoredExceptionHandler(1,vectored_fault);
+        return runtime_memory_selftest();
+    }
+#endif
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
@@ -826,7 +939,14 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     /* The PS4 user range must stay free of host allocations (GPU driver, heaps), and the guest
      * TCB needs one of the 64 TEB TLS slots before DLLs (Vulkan drivers) take them. */
+#ifndef UNCHARTED_UWP
     runtime_memory_reserve();
+#else
+    /* A UWP host already owns pages in this interval. Defer the desktop pool's
+     * reservation until its first allocation, so the CPU loader can be diagnosed
+     * independently. Xbox guest-memory mapping is the next milestone. */
+    puts("UWP milestone: large guest-pool reservation deferred until first guest allocation");
+#endif
     runtime_thread_tcb_offset();
 #endif
     int cpu_only = 0, strict_imports = 0, list_missing = 0;
@@ -871,7 +991,9 @@ int main(int argc, char **argv) {
         sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
         sfo_value(sfo,"APP_VER",version,sizeof(version),NULL);
+#ifndef UNCHARTED_UWP /* online play is desktop only */
         bbnet_configure(app0,serial,title,version);
+#endif
     }
     bbgpu_register_kernel();
 #ifdef _WIN32

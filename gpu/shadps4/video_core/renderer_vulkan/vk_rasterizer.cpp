@@ -1043,6 +1043,34 @@ void Rasterizer::PrintPipeStats() {
         }
     }
     std::printf("\n");
+    static u64 last_descriptors[2]{};
+    const u64 descriptors[2] = {Pipeline::descriptor_cycles[0].load(std::memory_order_relaxed),
+                                Pipeline::descriptor_cycles[1].load(std::memory_order_relaxed)};
+    static u64 last_counts[4]{};
+    u64 counts[4];
+    for (u32 i = 0; i < 4; ++i) {
+        counts[i] = Pipeline::descriptor_counts[i].load(std::memory_order_relaxed);
+    }
+    const double sets = std::max<double>(1.0, double(counts[0] - last_counts[0]));
+    std::printf("  descriptor sets: %.1f%% of the time on the draw thread, %.1f%% on the "
+                "recording thread; %.0f sets/s with %.1f buffers, %.1f images, %.1f samplers\n",
+                100.0 * (descriptors[0] - last_descriptors[0]) / cycles,
+                100.0 * (descriptors[1] - last_descriptors[1]) / cycles, sets / seconds,
+                (counts[1] - last_counts[1]) / sets, (counts[2] - last_counts[2]) / sets,
+                (counts[3] - last_counts[3]) / sets);
+    static u64 last_repeats[2]{};
+    const u64 repeats[2] = {Pipeline::descriptor_repeats[0].load(std::memory_order_relaxed),
+                            Pipeline::descriptor_repeats[1].load(std::memory_order_relaxed)};
+    std::printf("  set contents written before: %.1f%% exactly, %.1f%% apart from buffer offsets\n",
+                100.0 * (repeats[0] - last_repeats[0]) / sets,
+                100.0 * (repeats[1] - last_repeats[1]) / sets);
+    last_repeats[0] = repeats[0];
+    last_repeats[1] = repeats[1];
+    std::printf("  thread CPU: %s\n", BbThreads::CpuReport(seconds).c_str());
+    std::printf("  submissions by site: %s\n", Scheduler::TakeSubmitSites().c_str());
+    last_descriptors[0] = descriptors[0];
+    last_descriptors[1] = descriptors[1];
+    std::copy(std::begin(counts), std::end(counts), std::begin(last_counts));
     drain_sites.clear();
     draw_pipe->drains_by_reason = {};
     window = now;
@@ -2845,7 +2873,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
                 if (Regs().clipper_control.user_clip_plane_enable == 0) {
+#ifdef UNCHARTED_UWP
+                    buffer_infos.emplace_back(buffer_cache.GetNullBuffer()->Handle(),0,64_KB);
+#else
                     buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+#endif
                 } else {
                     auto& vk_buffer = buffer_cache.GetStreamBuffer();
                     std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
@@ -2860,6 +2892,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     const u64 offset = vk_buffer.Copy(planes.data(), ubo_size, alignment);
                     buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
                 }
+#ifdef UNCHARTED_UWP
+            } else if (desc.buffer_type == Shader::BufferType::DmaBuffers) {
+                auto views=buffer_cache.GetDmaViews();
+                buffer_infos.insert(buffer_infos.end(),views.begin(),views.end());
+#endif
             } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) {
                 const auto* bda_buffer = buffer_cache.GetBdaPageTableBuffer();
                 buffer_infos.emplace_back(bda_buffer->Handle(), 0, bda_buffer->SizeBytes());
@@ -2903,7 +2940,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                                      memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
             }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+#ifdef UNCHARTED_UWP
+                buffer_infos.emplace_back(buffer_cache.GetNullBuffer()->Handle(),0,64_KB);
+#else
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+#endif
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                 if (size != vsharp.GetSize()) {
@@ -2954,9 +2995,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified++;
         set_write.dstArrayElement = 0;
-        set_write.descriptorCount = 1;
+        set_write.descriptorCount = desc.buffer_type == Shader::BufferType::DmaBuffers ? Shader::NUM_DMA_BUFFERS : 1u;
         set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
-        set_write.pBufferInfo = &buffer_infos.back();
+        set_write.pBufferInfo = buffer_infos.data() + buffer_infos.size() - set_write.descriptorCount;
         ++binding.buffer;
     }
 }
@@ -3243,7 +3284,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         const auto& desc = *desc_ptr;
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
+#ifdef UNCHARTED_UWP
+            image_infos.emplace_back(VK_NULL_HANDLE,texture_cache.NullView(),vk::ImageLayout::eGeneral);
+#else
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+#endif
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
@@ -3467,7 +3512,11 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
         if (!entry.id) {
+#ifdef UNCHARTED_UWP
+            image_infos.emplace_back(VK_NULL_HANDLE,texture_cache.NullView(),vk::ImageLayout::eGeneral);
+#else
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+#endif
             continue;
         }
         texture_cache.MarkFound(entry.id);
@@ -3991,8 +4040,15 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.InvalidateMemory(addr, size, assume_locks);
-    texture_cache.InvalidateMemory(addr, size);
+    // Statistics (BB_FRAME_STATS, stall reports): time in each step, all threads.
+    {
+        BbStats::Timer timer{BbStats::t_inv_buffers};
+        buffer_cache.InvalidateMemory(addr, size, assume_locks);
+    }
+    {
+        BbStats::Timer timer{BbStats::t_inv_textures};
+        texture_cache.InvalidateMemory(addr, size);
+    }
     return true;
 }
 

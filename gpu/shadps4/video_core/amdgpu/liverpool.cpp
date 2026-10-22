@@ -8,6 +8,7 @@
 #endif
 #include <time.h>
 #include "bbport_copy.h"
+#include "bbport_threads.h"
 #include "bbport_toggles.h"
 #include <cstdio>
 #include <boost/preprocessor/stringize.hpp>
@@ -39,6 +40,102 @@ static std::chrono::microseconds SubmitDelay() {
         return env ? std::strtoll(env, nullptr, 10) : 0LL;
     }()};
     return delay;
+}
+
+// bbport: a WaitRegMem that lasts is logged after 2 s and then every 30 s: the value the GPU waits for tells
+// a hang's cause (loader.log). Checked every 1024 rounds, so the clock costs nothing while waits are short.
+struct WaitWatch {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point next = start + std::chrono::seconds(2);
+    u32 rounds = 0;
+    void Check(const PM4CmdWaitRegMem* wait, std::span<const u32> regs, const char* queue, u32 index) {
+        if ((++rounds & 1023) != 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next) {
+            return;
+        }
+        next = now + std::chrono::seconds(30);
+        static constexpr const char* compare[] = {"always", "<", "<=", "==", "!=", ">=", ">", "?"};
+        const bool memory = wait->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+        const u32 current = memory ? *wait->Address() : regs[wait->Reg()];
+        std::printf("GPU wait (%s queue %u) for %.0f s: %s %#llx is %#x, waits for (value & %#x) %s %#x\n", queue,
+                    index, std::chrono::duration<double>(now - start).count(), memory ? "memory" : "register",
+                    memory ? static_cast<unsigned long long>(wait->Address<u64>())
+                           : static_cast<unsigned long long>(wait->Reg()),
+                    current, wait->mask, compare[u32(wait->function.Value()) & 7], wait->ref);
+        std::fflush(stdout);
+    }
+};
+
+// bbport: the same for the other loops that spin until something else (the CPU, another engine) acts.
+struct SpinWatch {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point next = start + std::chrono::seconds(2);
+    u32 rounds = 0;
+    template <typename Describe>
+    void Check(const char* site, Describe&& describe) {
+        if ((++rounds & 1023) != 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next) {
+            return;
+        }
+        next = now + std::chrono::seconds(30);
+        char detail[160]{};
+        describe(detail, sizeof(detail));
+        std::printf("GPU spin (%s) for %.0f s: %s\n", site,
+                    std::chrono::duration<double>(now - start).count(), detail);
+        std::fflush(stdout);
+    }
+};
+
+// bbport: where the command processor is, for the thread report (uncharted_gpu_state, LocalState\threads.txt):
+// packets decoded, the last one's opcode and address, its queue (0 graphics, 1 constant engine, 2+n compute n).
+static std::atomic<u64> g_cp_packets{0};
+static std::atomic<u32> g_cp_opcode{0}, g_cp_queue{0};
+static std::atomic<uintptr_t> g_cp_packet{0};
+static Liverpool* g_liverpool{};
+static std::array<std::atomic<u64>, 32> g_cp_history{}; ///< the last packets: address << 8 | opcode
+static void NotePacket(const void* header, PM4ItOpcode opcode, u32 queue) {
+    const u64 count = g_cp_packets.fetch_add(1, std::memory_order_relaxed);
+    g_cp_history[count % g_cp_history.size()].store(
+        (static_cast<u64>(reinterpret_cast<uintptr_t>(header)) << 8) | static_cast<u8>(opcode),
+        std::memory_order_relaxed);
+    g_cp_packet.store(reinterpret_cast<uintptr_t>(header), std::memory_order_relaxed);
+    g_cp_opcode.store(static_cast<u32>(opcode), std::memory_order_relaxed);
+    g_cp_queue.store(queue, std::memory_order_relaxed);
+}
+
+extern "C" void uncharted_gpu_state(char* out, size_t size) {
+    const Liverpool* gpu = g_liverpool;
+    if (!gpu) {
+        std::snprintf(out, size, "not started");
+        return;
+    }
+    std::snprintf(out, size,
+                  "%llu packets decoded; last opcode %#x at %p on queue %u; %u submissions pending, %u host "
+                  "commands, idle %s",
+                  static_cast<unsigned long long>(g_cp_packets.load(std::memory_order_relaxed)),
+                  g_cp_opcode.load(std::memory_order_relaxed),
+                  reinterpret_cast<const void*>(g_cp_packet.load(std::memory_order_relaxed)),
+                  g_cp_queue.load(std::memory_order_relaxed), gpu->PendingSubmits(), gpu->PendingCommands(),
+                  gpu->IsGpuIdle() ? "yes" : "no");
+}
+
+/// The last packets the command processor decoded, oldest first ("opcode@address" each).
+extern "C" void uncharted_gpu_history(char* out, size_t size) {
+    const u64 count = g_cp_packets.load(std::memory_order_relaxed);
+    size_t used = 0;
+    out[0] = 0;
+    for (u64 i = count > g_cp_history.size() ? count - g_cp_history.size() : 0; i < count && used + 32 < size;
+         ++i) {
+        const u64 entry = g_cp_history[i % g_cp_history.size()].load(std::memory_order_relaxed);
+        used += std::snprintf(out + used, size - used, "%s%02x@%llx", used ? " " : "", unsigned(entry & 0xff),
+                              static_cast<unsigned long long>(entry >> 8));
+    }
 }
 
 static const char* dcb_task_name{"DCB_TASK"};
@@ -122,6 +219,7 @@ void Liverpool::ProcessCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     on_processor_thread = true;
+    BbThreads::RegisterCpu("decode");
 #ifndef _WIN32
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
@@ -130,6 +228,7 @@ void Liverpool::Process(std::stop_token stoken) {
     gpu_id = std::this_thread::get_id();
 #if defined(__linux__) || defined(_WIN32)
     gpu_tid = gettid();
+    g_liverpool = this;
 #endif
 
     while (!stoken.stop_requested()) {
@@ -272,13 +371,29 @@ namespace {
 void SignalEop(const PM4CmdEventWriteEop& eop) {
     eop.SignalFence(
         [](void* address, u64 data, u32 num_bytes) {
+            const auto started = BbStats::enabled ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
             auto* memory = Core::Memory::Instance();
             BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
             if (!memory->TryWriteBacking(address, &data, num_bytes)) {
                 memcpy(address, &data, num_bytes);
             }
+            if (BbStats::enabled) {
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count();
+                if (ms >= 5.0) std::printf("Fence backing write: %.3f ms; %p, %u bytes\n", ms, address, num_bytes);
+            }
         },
-        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+        [] {
+            const auto started = BbStats::enabled ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
+            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+            if (BbStats::enabled) {
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count();
+                if (ms >= 5.0) std::printf("Fence interrupt: %.3f ms\n", ms);
+            }
+        });
 }
 
 // bbport: end-of-pipe/-shader events run in order with the draws (Rasterizer::RunInOrder: on
@@ -464,6 +579,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        NotePacket(header, opcode, 1);
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
@@ -492,7 +608,12 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::WaitOnDeCounterDiff: {
             const auto diff = it_body[0];
+            SpinWatch watch;
             while ((cblock.de_count - cblock.ce_count) >= diff) {
+                watch.Check("constant engine, draw engine counter", [&](char* out, size_t size) {
+                    std::snprintf(out, size, "de %u, ce %u, waits for a difference below %u",
+                                  u32(cblock.de_count), u32(cblock.ce_count), u32(diff));
+                });
                 YIELD_CE();
             }
             break;
@@ -805,6 +926,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            NotePacket(header, opcode, 0);
             ApplyGraphicsRegisterPacket(regs, header, gfx_reg_checksum, &pipe_dirty);
             // DmaData to 0x3022C does nothing here (skipped below): no need to wait.
             if (rasterizer && !PipelinedOpcode(opcode) &&
@@ -1249,7 +1371,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    SpinWatch watch;
                     while (!mem_semaphore->Signaled()) {
+                        watch.Check("graphics semaphore", [&](char* out, size_t size) {
+                            std::snprintf(out, size, "memory %#llx is 0, waits for a signal",
+                                          static_cast<unsigned long long>(mem_semaphore->Address<u64>()));
+                        });
                         YIELD_GFX();
                     }
                     mem_semaphore->Decrement();
@@ -1265,7 +1392,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                SpinWatch watch;
                 while (!rewind->Valid()) {
+                    watch.Check("graphics rewind", [&](char* out, size_t size) {
+                        std::snprintf(out, size, "packet at %p not yet marked valid by the CPU",
+                                      static_cast<const void*>(rewind));
+                    });
                     YIELD_GFX();
                 }
                 break;
@@ -1297,7 +1429,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
                 // catch up before yielding to other queues.
+                WaitWatch watch;
                 while (!wait_reg_mem->Test(regs.reg_array)) {
+                    watch.Check(wait_reg_mem, regs.reg_array, "graphics", 0);
                     if (rasterizer && !rasterizer->DrawPipeIdle()) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                         continue;
@@ -1326,7 +1460,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::WaitOnCeCounter: {
+                SpinWatch watch;
                 while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
+                    watch.Check("draw engine, constant engine counter", [&](char* out, size_t size) {
+                        std::snprintf(out, size, "ce %u, de %u", u32(cblock.ce_count), u32(cblock.de_count));
+                    });
                     RESUME_GFX(ce_task);
                 }
                 break;
@@ -1460,6 +1598,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        NotePacket(header, opcode, 2 + vqid);
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1533,7 +1672,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            SpinWatch watch;
             while (!rewind->Valid()) {
+                watch.Check("compute rewind", [&](char* out, size_t size) {
+                    std::snprintf(out, size, "queue %u, packet at %p not yet marked valid by the CPU", vqid,
+                                  static_cast<const void*>(rewind));
+                });
                 YIELD_ASC(vqid);
             }
             break;
@@ -1632,7 +1776,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                SpinWatch watch;
                 while (!mem_semaphore->Signaled()) {
+                    watch.Check("compute semaphore", [&](char* out, size_t size) {
+                        std::snprintf(out, size, "queue %u, memory %#llx is 0, waits for a signal", vqid,
+                                      static_cast<unsigned long long>(mem_semaphore->Address<u64>()));
+                    });
                     YIELD_ASC(vqid);
                 }
                 mem_semaphore->Decrement();
@@ -1642,7 +1791,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            WaitWatch watch;
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                watch.Check(wait_reg_mem, regs.reg_array, "compute", vqid);
                 YIELD_ASC(vqid);
             }
             break;

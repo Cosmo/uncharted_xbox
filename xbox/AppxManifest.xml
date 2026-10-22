@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" IgnorableNamespaces="uap">
+  <Identity Name="UnchartedLauncher" Publisher="CN=uncharted_xbox" Version="1.0.0.0" ProcessorArchitecture="x64" />
+  <Properties><DisplayName>Uncharted Launcher</DisplayName><PublisherDisplayName>uncharted_xbox</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+    <PackageDependency Name="Microsoft.VCLibs.140.00" MinVersion="14.0.30035.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+  </Dependencies>
+  <Resources><Resource Language="en-us" /></Resources>
+  <Applications>
+    <Application Id="App" Executable="uncharted_uwp.exe" EntryPoint="Uncharted.Uwp.App">
+      <uap:VisualElements DisplayName="Uncharted Launcher" Description="Runs Uncharted: The Nathan Drake Collection from your own dump" BackgroundColor="#181818" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#181818" />
+      </uap:VisualElements>
+      <Extensions>
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="unchartedassets">
+            <uap:DisplayName>Uncharted game dump</uap:DisplayName>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.bin</uap:FileType><uap:FileType>.elf</uap:FileType>
+              <uap:FileType>.prx</uap:FileType><uap:FileType>.sprx</uap:FileType>
+              <uap:FileType>.sfo</uap:FileType><uap:FileType>.pak</uap:FileType>
+              <uap:FileType>.psarc</uap:FileType><uap:FileType>.xvag</uap:FileType>
+              <uap:FileType>.vag</uap:FileType><uap:FileType>.wav</uap:FileType>
+              <uap:FileType>.at9</uap:FileType><uap:FileType>.bnk</uap:FileType>
+              <uap:FileType>.sbf</uap:FileType><uap:FileType>.bsf</uap:FileType>
+              <uap:FileType>.dci</uap:FileType><uap:FileType>.dds</uap:FileType>
+              <uap:FileType>.png</uap:FileType><uap:FileType>.plt</uap:FileType>
+              <uap:FileType>.trp</uap:FileType><uap:FileType>.dat</uap:FileType>
+              <uap:FileType>.info</uap:FileType><uap:FileType>.sha</uap:FileType>
+              <uap:FileType>.sig</uap:FileType><uap:FileType>.json</uap:FileType>
+              <uap:FileType>.csv</uap:FileType><uap:FileType>.txt</uap:FileType>
+              <uap:FileType>.xml</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
+        </uap:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities><Capability Name="codeGeneration" /><uap:Capability Name="removableStorage" /></Capabilities>
+</Package>

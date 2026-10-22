@@ -622,7 +622,15 @@ static const RuntimeExport exports[]={
     {"sceNpScoreGetBoardInfo",np_signed_out}, {"sceNpScoreGetGameData",np_signed_out},
     {"sceNpScoreGetRankingByNpIdPcId",np_signed_out}, {"sceNpScoreGetRankingByRange",np_signed_out},
     {"sceNpScoreRecordGameData",np_signed_out}, {"sceNpScoreRecordScore",np_signed_out},
-    {"sceNpScoreSetPlayerCharacterId",ok_void},
+    {"sceNpScoreSetPlayerCharacterId",ok_void}, {"sceNpScorePollAsync",np_poll},
+    /* Title user storage (all three games) and the signaling queries U2 and U3 make: offline like the
+     * rest. Online play answers them through bbnet (desktop only); the Xbox has only these. */
+    {"sceNpTusCreateNpTitleCtx",np_request_ctx}, {"sceNpTusDeleteNpTitleCtx",ok_void},
+    {"sceNpTusCreateRequest",np_request}, {"sceNpTusDeleteRequest",ok_void}, {"sceNpTusPollAsync",np_poll},
+    {"sceNpTusGetDataAsync",np_signed_out}, {"sceNpTusSetDataAsync",np_signed_out},
+    {"sceNpTusGetFriendsDataStatusAsync",np_signed_out},
+    {"sceNpSignalingGetConnectionInfo",np_signed_out}, {"sceNpSignalingGetPeerNetInfo",np_signed_out},
+    {"sceNpSignalingTerminateConnection",ok_void},
     {"sceVoiceCreatePort",voice_port}, {"sceVoiceDeletePort",ok_void},
     {"sceVoiceConnectIPortToOPort",ok_void}, {"sceVoiceDisconnectIPortFromOPort",ok_void},
     {"sceVoiceStart",ok_void}, {"sceVoiceStop",ok_void}, {"sceVoiceGetPortInfo",voice_info},

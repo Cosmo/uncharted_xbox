@@ -69,6 +69,17 @@ enum : std::uint64_t {
     // when nothing moves. Static-camera flicker of railings/window bars p99.9 -45% (2026-10-03).
     TaaKeepNearerHistory = 1ull << 55,
     SceneMipBias = 1ull << 57, ///< negative LOD bias of G-buffer samplers at reduced scene sizes
+    /// A texture/storage request for the top rows of a cached image (same address and layout)
+    /// uses that image, instead of creating and uploading a new one (texture_cache.cpp).
+    PartialHeightViews = 1ull << 58,
+    /// Without push descriptors (Dozen), descriptor sets are allocated and written on the
+    /// recording thread with the command that binds them (vk_pipeline_common.cpp).
+    DescriptorThread = 1ull << 59,
+    /// End-of-pipe events wait for the recording thread's host copies only when an image is
+    /// read back, the one case that protects pages (texture_cache.cpp).
+    EopCopyWaitForReadbacks = 1ull << 60,
+    /// Bit 62 is read by the UWP memory layer (xbox/platform/guest_memory.inc, host_protect):
+    /// protection changes one 4 KiB page at a time again.
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {
@@ -98,9 +109,10 @@ inline std::atomic<std::uint64_t> gpu_frames{0};
 /// Wall time spent in operations suspected of stalls (ns, all threads).
 inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}, t_refresh{0},
     t_staging{0}, t_host_wait{0}, t_copy{0}, copy_bytes{0}, t_read_faults{0}, read_faults{0},
-    t_write_faults{0}, t_copy_cpu{0}, copy_sys_us{0}, copy_minflt{0};
-/// Diagnostics are collected only with BB_FRAME_STATS=1.
-inline const bool enabled = [] {
+    t_write_faults{0}, t_copy_cpu{0}, copy_sys_us{0}, copy_minflt{0}, t_gc{0}, t_readback_wait{0},
+    t_inv_readbacks{0}, t_inv_buffers{0}, t_inv_textures{0};
+/// Diagnostics are collected only with BB_FRAME_STATS=1 (UWP: read again at bbgpu_init).
+inline bool enabled = [] {
     const char* env = std::getenv("BB_FRAME_STATS");
     return env && env[0] == '1';
 }();

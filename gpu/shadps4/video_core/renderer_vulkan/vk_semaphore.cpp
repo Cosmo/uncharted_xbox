@@ -14,7 +14,8 @@
 
 namespace Vulkan {
 
-constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
+// Not WAIT_TIMEOUT: <windows.h> defines that name as a macro (UWP builds include it here).
+constexpr u64 InfiniteSemaphoreWait = std::numeric_limits<u64>::max();
 // bbport: called once by a GPU wait that has blocked for 5 seconds (the scheduler prints what
 // the queue is waiting for).
 void (*g_gpu_stall_report)() = nullptr;
@@ -143,7 +144,7 @@ void Semaphore::Wait(u64 tick) {
     bool reported = false;
     vk::Result result;
     while ((result = instance.GetDevice().waitSemaphores(
-                &wait_info, reported ? WAIT_TIMEOUT : StallReport)) != vk::Result::eSuccess) {
+                &wait_info, reported ? InfiniteSemaphoreWait : StallReport)) != vk::Result::eSuccess) {
         if (result == vk::Result::eErrorDeviceLost) {
             DeviceLost(instance.GetDevice());
         }

@@ -120,7 +120,13 @@ FrameGenerator::~FrameGenerator() {
 }
 
 bool FrameGenerator::Wanted() const {
+#ifdef UNCHARTED_UWP
+    // UWP: no frame generation (FSR 3.1 and DLSS are PC features; the FSR 1 pass it uses for the
+    // HUD-less picture is not created there).
+    return false;
+#else
     return BbSettings::Get().frame_gen != BbSettings::FrameGenOff;
+#endif
 }
 
 void FrameGenerator::CreatePipeline() {

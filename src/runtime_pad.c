@@ -24,6 +24,9 @@
 #include <time.h>
 #include <SDL3/SDL.h>
 #include <sys/stat.h>
+#ifdef UNCHARTED_UWP
+#include "input.h"
+#endif
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
 #define ERR_INVALID_HANDLE ((int32_t)0x80920003)
@@ -523,6 +526,13 @@ static void sample_host(PadData *d) {
     d->orientation[3]=1.0f;
     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
     d->timestamp=now_us();
+#ifdef UNCHARTED_UWP
+    uint8_t axes[6]={128,128,128,128,0,0};
+    d->connected=uncharted_uwp_gamepad(&d->buttons,axes);
+    d->left_x=axes[0]; d->left_y=axes[1]; d->right_x=axes[2]; d->right_y=axes[3];
+    d->l2=axes[4]; d->r2=axes[5];
+    return;
+#endif
     static int loaded;
     if (!loaded) { load_input(); loaded=1; }
     SDL_Gamepad *g=current_gamepad();
@@ -628,6 +638,7 @@ static void sample_host(PadData *d) {
  * touchpad defaults to a left-side click; lx= ly= rx= ry= (0..255) override
  * the sticks. An empty file releases everything. */
 static struct { uint32_t buttons; int stick[4]; int touch_side; float mouse[2]; } injected={0,{-1,-1,-1,-1},-1,{0,0}};
+static int injection_available;
 static int replay_armed;      /* 1 while a BB_PAD_REPLAY recording plays, 2 once it ended */
 static uint64_t replay_start; /* 0: (re)start at the next sample */
 static void read_inject(void) {
@@ -649,6 +660,7 @@ static void read_inject(void) {
 #endif
     FILE *f=fopen(path,"r");
     if (!f) return;
+    injection_available=1;
     static const struct { const char *name; uint32_t ps; } names[]={
         {"cross",BTN_CROSS}, {"circle",BTN_CIRCLE}, {"square",BTN_SQUARE}, {"triangle",BTN_TRIANGLE},
         {"l1",BTN_L1}, {"r1",BTN_R1}, {"l2",BTN_L2}, {"r2",BTN_R2}, {"l3",BTN_L3}, {"r3",BTN_R3},
@@ -748,9 +760,26 @@ static void replay_sample(PadData *d) {
 /* After the menu or the text dialog closes, buttons still held (the Cross that accepted a
  * name) stay hidden until released: the game would take them as a new press. */
 static int hold_after_capture;
+#ifdef UNCHARTED_UWP
+/* The UWP window has no SDL controller events. Dialogs sample the same physical
+ * and scripted buttons independently of guest reads, which may pause in a save. */
+uint32_t runtime_pad_dialog_buttons(void) {
+    uint32_t buttons=0; uint8_t axes[6]={128,128,128,128,0,0};
+    uncharted_uwp_dialog_gamepad(&buttons,axes);
+    pthread_mutex_lock(&lock);
+    read_inject(); buttons|=injected.buttons;
+    pthread_mutex_unlock(&lock);
+    return buttons;
+}
+#endif
 static void sample(PadData *d) {
     sample_host(d);
-    if (bbgpu_overlay_captures_input()) { hold_after_capture=1; return; }
+    if (bbgpu_overlay_captures_input()) {
+        hold_after_capture=1;
+        d->buttons=0; d->left_x=d->left_y=d->right_x=d->right_y=128;
+        d->l2=d->r2=0; d->touch_count=0;
+        return;
+    }
     record_sample(d);
     read_inject();
     /* scripted mouse motion (mx= my=) goes where the player's mouse would */
@@ -765,6 +794,7 @@ static void sample(PadData *d) {
     }
     mouse_inject_us=inject_now;
     replay_sample(d);
+    if (injection_available || replay_armed) d->connected=1;
     d->buttons|=injected.buttons;
     aim_held=(d->buttons & BTN_L2)!=0;
     if (injected.touch_side>=0) touch_click(d,injected.touch_side);
@@ -826,7 +856,14 @@ static ABI int32_t pad_info(int32_t handle, ControllerInfo *info) {
     info->dead_zone_left=info->dead_zone_right=2;
     info->connection_type=0; info->connected=1; info->device_class=0;
     pthread_mutex_lock(&lock);
+#ifdef UNCHARTED_UWP
+    uint32_t buttons=0; uint8_t axes[6];
+    info->connected=uncharted_uwp_gamepad(&buttons,axes);
+    read_inject();
+    if (injection_available || replay_armed) info->connected=1;
+#else
     current_gamepad();
+#endif
     info->connected_count=connected_count ? connected_count : 1;
     pthread_mutex_unlock(&lock);
     return 0;
@@ -835,8 +872,12 @@ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     if (!param) return ERR_INVALID_ARG;
     pthread_mutex_lock(&lock);
+#ifdef UNCHARTED_UWP
+    uncharted_uwp_vibration(param[0],param[1]);
+#else
     SDL_Gamepad *g=current_gamepad();
     if (g) SDL_RumbleGamepad(g,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257),1000);
+#endif
     pthread_mutex_unlock(&lock);
     return 0;
 }

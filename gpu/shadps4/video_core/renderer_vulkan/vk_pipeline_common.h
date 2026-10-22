@@ -7,6 +7,8 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
+#include <atomic>
+
 #include <boost/container/small_vector.hpp>
 
 namespace Shader {
@@ -36,6 +38,11 @@ public:
         return *pipeline;
     }
 
+    /// False when the driver refused the pipeline (on the Xbox, Dozen: its draws are skipped).
+    bool IsValid() const noexcept {
+        return static_cast<bool>(pipeline);
+    }
+
     vk::PipelineLayout GetLayout() const noexcept {
         return *pipeline_layout;
     }
@@ -59,6 +66,15 @@ public:
 
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
+
+    /// bbport (statistics): cycles spent allocating and writing descriptor sets on the
+    /// draw's thread [0] and on the recording thread [1].
+    static inline std::atomic<u64> descriptor_cycles[2]{};
+    /// bbport (statistics): sets written, and their buffer, image and sampler descriptors.
+    static inline std::atomic<u64> descriptor_counts[4]{};
+    /// bbport (statistics, BB_FRAME_STATS): sets whose contents were written recently,
+    /// exactly [0] and apart from the buffer offsets [1].
+    static inline std::atomic<u64> descriptor_repeats[2]{};
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;

@@ -29,6 +29,12 @@ extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
 std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
+#ifdef UNCHARTED_UWP
+extern "C" void runtime_wait_begin(const char* kind, const char* object, const void* address,
+                                   const void* holder, uintptr_t caller);
+extern "C" void runtime_wait_end(void);
+#endif
+
 namespace Libraries::GnmDriver {
 
 using namespace AmdGpu;
@@ -88,7 +94,15 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
 static void WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
+#ifdef UNCHARTED_UWP
+    // bbport: noted for the thread report (src/runtime_thread.c).
+    runtime_wait_begin("GPU idle", "submission done", &submission_lock, nullptr,
+                       reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+#endif
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+#ifdef UNCHARTED_UWP
+    runtime_wait_end();
+#endif
 }
 
 // Write a special ending NOP packet with N DWs data block

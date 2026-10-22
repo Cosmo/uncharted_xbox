@@ -11,6 +11,12 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include <array>
+#include <bit>
+#include <cstdlib>
+#include <vector>
+#include <x86intrin.h>
+#include <xxhash.h>
 
 namespace Vulkan {
 
@@ -37,8 +43,64 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     if (set_writes.empty()) {
         return;
     }
+    {
+        u64 buffers = 0, images = 0, samplers = 0;
+        for (const auto& write : set_writes) {
+            if (write.pBufferInfo) {
+                buffers += write.descriptorCount;
+            } else if (write.descriptorType == vk::DescriptorType::eSampler) {
+                samplers += write.descriptorCount;
+            } else {
+                images += write.descriptorCount;
+            }
+        }
+        descriptor_counts[0].fetch_add(1, std::memory_order_relaxed);
+        descriptor_counts[1].fetch_add(buffers, std::memory_order_relaxed);
+        descriptor_counts[2].fetch_add(images, std::memory_order_relaxed);
+        descriptor_counts[3].fetch_add(samplers, std::memory_order_relaxed);
+        // Statistics: how often a set's contents were written before (recently), exactly and
+        // apart from the buffer offsets.
+        static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
+        if (stats) {
+            static std::vector<u64> words;
+            static std::vector<size_t> offsets;
+            static std::array<u64, 1u << 16> seen_exact{}, seen_handles{};
+            words.clear();
+            offsets.clear();
+            words.push_back(std::bit_cast<u64>(*desc_layout));
+            for (const auto& write : set_writes) {
+                words.push_back(u64{write.dstBinding} << 32 | u32(write.descriptorType));
+                for (u32 i = 0; i < write.descriptorCount; ++i) {
+                    if (write.pBufferInfo) {
+                        words.push_back(std::bit_cast<u64>(write.pBufferInfo[i].buffer));
+                        words.push_back(write.pBufferInfo[i].range);
+                        offsets.push_back(words.size());
+                        words.push_back(write.pBufferInfo[i].offset);
+                    } else if (write.pImageInfo) {
+                        words.push_back(std::bit_cast<u64>(write.pImageInfo[i].imageView));
+                        words.push_back(std::bit_cast<u64>(write.pImageInfo[i].sampler));
+                    }
+                }
+            }
+            const u64 exact = XXH3_64bits(words.data(), words.size() * sizeof(u64)) | 1;
+            for (const size_t at : offsets) {
+                words[at] = 0;
+            }
+            const u64 handles = XXH3_64bits(words.data(), words.size() * sizeof(u64)) | 1;
+            u64& slot_exact = seen_exact[exact & 0xffff];
+            u64& slot_handles = seen_handles[handles & 0xffff];
+            descriptor_repeats[0].fetch_add(slot_exact == exact, std::memory_order_relaxed);
+            descriptor_repeats[1].fetch_add(slot_handles == handles, std::memory_order_relaxed);
+            slot_exact = exact;
+            slot_handles = handles;
+        }
+    }
 
-    if (uses_push_descriptors) {
+    // bbport: without push descriptors (Dozen) a set is allocated and written per draw, which
+    // costs as much as the rest of the draw. With threaded recording that work goes with the
+    // command to the recording thread (toggle DescriptorThread: on this thread, as before).
+    const bool descriptor_thread = !BbToggle::Disabled(BbToggle::DescriptorThread);
+    if (uses_push_descriptors || (descriptor_thread && scheduler.IsRecordingDeferred())) {
         if (!scheduler.IsRecordingDeferred()) {
             scheduler.Record([&](vk::CommandBuffer cmdbuf) {
                 cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
@@ -70,18 +132,37 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
                     scheduler.RecordData(std::span{write.pTexelBufferView, write.descriptorCount}).data();
             }
         }
-        scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
-            cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
+        if (uses_push_descriptors) {
+            scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
+                cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
+            });
+            return;
+        }
+        // The heap is locked: the toggle can send the next set to this thread while the recording
+        // thread still allocates earlier ones.
+        scheduler.Record([bind_point, layout, writes, set_layout = *desc_layout, heap = &desc_heap,
+                          device = instance.GetDevice()](vk::CommandBuffer cmdbuf) {
+            const u64 start = __rdtsc();
+            const auto desc_set = heap->Commit(set_layout);
+            auto* patched = const_cast<vk::WriteDescriptorSet*>(writes.data());
+            for (size_t i = 0; i < writes.size(); ++i) {
+                patched[i].dstSet = desc_set;
+            }
+            device.updateDescriptorSets(writes, {});
+            cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
+            descriptor_cycles[1].fetch_add(__rdtsc() - start, std::memory_order_relaxed);
         });
         return;
     }
 
     // Descriptor set updates are device calls: they stay on this thread.
+    const u64 start = __rdtsc();
     const auto desc_set = desc_heap.Commit(*desc_layout);
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
+    descriptor_cycles[0].fetch_add(__rdtsc() - start, std::memory_order_relaxed);
     scheduler.Record([bind_point, layout, desc_set](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
     });

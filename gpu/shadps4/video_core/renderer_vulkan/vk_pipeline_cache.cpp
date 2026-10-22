@@ -39,10 +39,21 @@ constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
 constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 512},
-    vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 8192},
+    vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer,
+#ifdef UNCHARTED_UWP
+                          16384},
+#else
+                          8192},
+#endif
     vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 8192},
     vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
+#ifdef UNCHARTED_UWP
+    // bbport (UWP): sets average 1.5 samplers; 1024 ran a pool dry after ~700 sets, a pool
+    // change every ~4 ms. 2048 is the most a D3D12 sampler heap holds on the Series X.
+    vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 2048},
+#else
     vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
+#endif
 };
 
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
@@ -287,7 +298,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
         .max_shared_memory_size = instance.MaxComputeSharedMemorySize(),
-        .supported_spirv = SpirvVersion1_6,
+        .supported_spirv = instance.ApiVersion() >= VK_API_VERSION_1_3 ? SpirvVersion1_6 : 0x00010500,
         .subgroup_size = instance.SubgroupSize(),
         .sparse_page_shift = sparse_page_shift,
         .support_int8 = instance.IsShaderInt8Supported(),
@@ -295,6 +306,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .support_int64 = instance.IsShaderInt64Supported(),
         .support_float16 = instance.IsShaderFloat16Supported(),
         .support_float64 = instance.IsShaderFloat64Supported(),
+        .support_demote = instance.ApiVersion() >= VK_API_VERSION_1_3,
         .supports_denorm_behavior_independence =
             vk12_props.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone,
         .supports_rounding_mode_independence =
@@ -345,12 +357,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
-    WarmUp();
-
+    // The driver cache exists before the warm-up: it loads the saved driver data into it and
+    // saves it again afterwards (vk_pipeline_serialization.cpp).
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+    WarmUp();
 }
 
 PipelineCache::~PipelineCache() = default;
@@ -435,7 +448,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
             sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
 
-        RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
+        // A pipeline the driver refused is not saved for the next warm-up.
+        if (it->second->IsValid()) {
+            RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
+        }
         ++num_new_pipelines;
 
         if (EmulatorSettings.IsShaderCollect()) {
@@ -448,7 +464,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         sel.fetch_shader.reset();
     }
-    return it->second.get();
+    // Draws with a refused pipeline are skipped (the callers check for null).
+    return it->second->IsValid() ? it->second.get() : nullptr;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -480,6 +497,19 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     std::memset(&sel.graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = (*sel.regs);
     auto& key = sel.graphics_key;
+
+    // bbport (Xbox): Dozen creates a D3D12 pipeline state per combination of these dynamic states
+    // at draw time (100-170 ms stalls); on Dozen their values go into the pipeline key instead
+    // (BB_BAKED_PIPELINES=0 keeps them dynamic).
+    static const bool bake_states = [&] {
+        const char* env = std::getenv("BB_BAKED_PIPELINES");
+        return instance.GetDriverID() == vk::DriverId::eMesaDozen && !(env && env[0] == '0');
+    }();
+    if (bake_states) {
+        key.baked = GetBakedGraphicsState(regs, instance.IsListRestartSupported(),
+                                         instance.IsPatchListRestartSupported(),
+                                         instance.IsDepthBoundsSupported());
+    }
 
     const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
 
@@ -982,6 +1012,9 @@ void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, Shader::HwSt
         std::filesystem::create_directories(dump_dir);
     }
     const auto filename = fmt::format("{}.{}", GetShaderName(stage, hash, perm_idx), ext);
+#ifdef UNCHARTED_UWP
+    std::fprintf(stderr,"UWP shader dump: %s (%zu bytes)\n",filename.c_str(),code.size_bytes());
+#endif
     const auto file = IOFile{dump_dir / filename, FileAccessMode::Create};
     file.WriteSpan(code);
 }

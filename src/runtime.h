@@ -25,6 +25,13 @@ uintptr_t runtime_mutex_resolve(const char *name);
 void runtime_mutex_report(void);
 uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
+#ifdef UNCHARTED_UWP
+int runtime_memory_handle_commit_fault(uintptr_t address,int access);
+int runtime_memory_handle_commit_fault_at(uintptr_t address,int access,int guest_code);
+void runtime_memory_start_paging(void);
+uint64_t runtime_memory_page_out(uint64_t bytes);
+int runtime_memory_selftest(void);
+#endif
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 const char *runtime_import_name(const char *name);
 uintptr_t runtime_rwlock_resolve(const char *name);
@@ -104,4 +111,12 @@ typedef struct {
     const unsigned char *patch;
 } RuntimeGuestCallback;
 const RuntimeGuestCallback *runtime_guest_callbacks(size_t *count);
+/* Waits of guest threads (runtime_thread.c), listed by runtime_wait_report. */
+void *runtime_thread_self(void);
+void runtime_wait_begin(const char *kind,const char *object,const void *address,const void *holder,uintptr_t caller);
+void runtime_wait_end(void);
+void runtime_wait_report(void);
+/* Guest yields and zero-length sleeps, for the CPU report (runtime_thread.c). */
+void runtime_thread_count_yield(int zero_sleep);
+void runtime_sample_threads(void); /* probe.c, UWP: stacks of the GPU threads for the report */
 #endif

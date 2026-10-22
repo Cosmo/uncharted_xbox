@@ -8,6 +8,7 @@
 #include <windows.h>
 #endif
 #include <cstdlib>
+#include <map>
 #include <unordered_map>
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -329,6 +330,7 @@ void Scheduler::SyncRecording() {
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("bb:VkRecorder");
+    BbThreads::RegisterCpu("recorder");
     while (true) {
         // Spin briefly before sleeping: the next chunk usually follows within microseconds,
         // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
@@ -371,22 +373,43 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
     }
 }
 
-void Scheduler::Flush(SubmitInfo& info) {
+void Scheduler::Flush(SubmitInfo& info, std::source_location caller) {
     // When flushing, we only send data to the driver; no waiting is necessary.
-    SubmitExecution(info);
+    SubmitExecution(info, caller);
 }
 
-void Scheduler::Flush() {
+void Scheduler::Flush(std::source_location caller) {
     SubmitInfo info{};
-    Flush(info);
+    Flush(info, caller);
 }
 
-void Scheduler::Finish() {
+namespace {
+std::mutex submit_sites_mutex;
+std::map<std::pair<std::string, u32>, u64> submit_sites;
+} // namespace
+
+std::string Scheduler::TakeSubmitSites() {
+    std::scoped_lock lock{submit_sites_mutex};
+    std::vector<std::pair<u64, std::string>> sorted;
+    for (const auto& [site, count] : submit_sites) {
+        const auto slash = site.first.find_last_of("/\\");
+        sorted.emplace_back(count, site.first.substr(slash + 1) + ":" + std::to_string(site.second));
+    }
+    submit_sites.clear();
+    std::sort(sorted.begin(), sorted.end(), std::greater{});
+    std::string out;
+    for (size_t i = 0; i < sorted.size() && i < 6; ++i) {
+        out += (i ? ", " : "") + sorted[i].second + " " + std::to_string(sorted[i].first);
+    }
+    return out;
+}
+
+void Scheduler::Finish(std::source_location caller) {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
-    SubmitExecution(info);
-    Wait(presubmit_tick);
+    SubmitExecution(info, caller);
+    Wait(presubmit_tick, caller);
 }
 
 void Scheduler::WaitSubmitted() {
@@ -396,11 +419,11 @@ void Scheduler::WaitSubmitted() {
     }
 }
 
-void Scheduler::Wait(u64 tick) {
+void Scheduler::Wait(u64 tick, std::source_location caller) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
-        Flush(info);
+        Flush(info, caller);
     }
     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
     work_semaphore.Wait(tick);
@@ -451,7 +474,11 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 #endif
 }
 
-void Scheduler::SubmitExecution(SubmitInfo& info) {
+void Scheduler::SubmitExecution(SubmitInfo& info, std::source_location caller) {
+    if (BbStats::enabled) {
+        std::scoped_lock lock{submit_sites_mutex};
+        ++submit_sites[{caller.file_name(), caller.line()}];
+    }
     std::scoped_lock lk{submit_mutex};
     // bbport: BB_SUBMIT_THREADS=1 names each thread that submits through this scheduler (once).
     static const bool submit_threads = std::getenv("BB_SUBMIT_THREADS") != nullptr;

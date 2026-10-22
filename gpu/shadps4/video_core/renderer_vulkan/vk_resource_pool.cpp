@@ -119,6 +119,7 @@ DescriptorHeap::~DescriptorHeap() {
 }
 
 vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
+    std::scoped_lock lock{mutex};
     const u64 set_key = std::bit_cast<u64>(set_layout);
     const auto [it, _] = descriptor_sets.try_emplace(set_key);
 
@@ -180,7 +181,12 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
 
 void DescriptorHeap::CreateDescriptorPool() {
     const vk::DescriptorPoolCreateInfo pool_info = {
-        .flags = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind,
+        .flags =
+#ifdef UNCHARTED_UWP
+            vk::DescriptorPoolCreateFlagBits{},
+#else
+            vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind,
+#endif
         .maxSets = descriptor_heap_count,
         .poolSizeCount = static_cast<u32>(pool_sizes.size()),
         .pPoolSizes = pool_sizes.data(),

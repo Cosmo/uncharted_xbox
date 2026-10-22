@@ -4,6 +4,7 @@
 #pragma once
 
 #include <mutex>
+#include <memory>
 #include <vector>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -11,6 +12,7 @@
 namespace Frontend {
 class WindowSDL;
 }
+namespace UnchartedUwp { class Presenter; }
 
 namespace Vulkan {
 
@@ -36,6 +38,14 @@ public:
 
     vk::SurfaceKHR GetSurface() const {
         return surface;
+    }
+
+    static constexpr vk::ImageLayout PresentLayout() {
+#ifdef UNCHARTED_UWP
+        return vk::ImageLayout::eGeneral;
+#else
+        return vk::ImageLayout::ePresentSrcKHR;
+#endif
     }
 
     vk::Image Image() const {
@@ -113,6 +123,9 @@ private:
 
 private:
     const Instance& instance;
+#ifdef UNCHARTED_UWP
+    std::unique_ptr<UnchartedUwp::Presenter> bridge;
+#endif
     const Frontend::WindowSDL& window;
     vk::SwapchainKHR swapchain{};
     vk::SurfaceKHR surface{};

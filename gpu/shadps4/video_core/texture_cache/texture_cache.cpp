@@ -19,6 +19,11 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
+#ifdef UNCHARTED_UWP
+#include "texture_probe.h"
+extern "C" uint64_t uncharted_uwp_app_memory_usage();
+extern "C" uint64_t uncharted_uwp_app_memory_limit();
+#endif
 
 namespace VideoCore {
 
@@ -32,6 +37,25 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
+#ifdef UNCHARTED_UWP
+    null_image=UniqueImage(instance.GetDevice(),instance.GetAllocator());
+    null_image.Create({.imageType=vk::ImageType::e2D,.format=vk::Format::eR8G8B8A8Unorm,
+        .extent={1,1,1},.mipLevels=1,.arrayLayers=1,.samples=vk::SampleCountFlagBits::e1,
+        .tiling=vk::ImageTiling::eOptimal,.usage=vk::ImageUsageFlagBits::eSampled|vk::ImageUsageFlagBits::eStorage|vk::ImageUsageFlagBits::eTransferDst,
+        .sharingMode=vk::SharingMode::eExclusive});
+    null_view=Vulkan::Check(instance.GetDevice().createImageViewUnique({.image=null_image.image,.viewType=vk::ImageViewType::e2D,
+        .format=vk::Format::eR8G8B8A8Unorm,.subresourceRange={vk::ImageAspectFlagBits::eColor,0,1,0,1}}));
+    scheduler.Record([image=null_image.image](vk::CommandBuffer cmd) {
+        vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor,0,1,0,1};
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,vk::PipelineStageFlagBits::eTransfer,{}, {}, {},
+            vk::ImageMemoryBarrier{.dstAccessMask=vk::AccessFlagBits::eTransferWrite,.oldLayout=vk::ImageLayout::eUndefined,
+                .newLayout=vk::ImageLayout::eGeneral,.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
+                .image=image,.subresourceRange=range});
+        cmd.clearColorImage(image,vk::ImageLayout::eGeneral,vk::ClearColorValue{std::array<float,4>{0,0,0,0}},range);
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,vk::PipelineStageFlagBits::eAllCommands,{},
+            vk::MemoryBarrier{.srcAccessMask=vk::AccessFlagBits::eTransferWrite,.dstAccessMask=vk::AccessFlagBits::eShaderRead|vk::AccessFlagBits::eShaderWrite},{},{});
+    });
+#endif
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -846,6 +870,9 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+#ifdef UNCHARTED_UWP
+    UnchartedUwp::InspectTexture(runtime,image,buffer,offset,in_buffer,in_offset);
+#endif
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
@@ -1016,6 +1043,22 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 }
 
 void TextureCache::GarbageCollectImages() {
+    BbStats::Timer gc_timer{BbStats::t_gc};
+#ifdef UNCHARTED_UWP
+    // CPU guest pages and GPU heaps share the UWP app limit. DXGI's GPU budget alone
+    // does not leave room for scene loads and transient driver allocations.
+    total_used_memory = uncharted_uwp_app_memory_usage();
+    static const u64 test_budget = [] {
+        const char* env = std::getenv("BB_GC_BUDGET_MB");
+        const u64 mb = env ? std::strtoull(env, nullptr, 10) : 0;
+        return mb >= 1024 && mb <= 65536 ? mb << 20 : 0;
+    }();
+    const u64 app_budget = test_budget ? std::min(test_budget, uncharted_uwp_app_memory_limit())
+                                      : uncharted_uwp_app_memory_limit();
+    trigger_gc_memory = app_budget > 768_MB ? app_budget - 768_MB : app_budget / 2;
+    pressure_gc_memory = app_budget > 512_MB ? app_budget - 512_MB : app_budget * 3 / 4;
+    critical_gc_memory = app_budget > 256_MB ? app_budget - 256_MB : app_budget * 7 / 8;
+#else
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
         // bbport: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
@@ -1037,12 +1080,14 @@ void TextureCache::GarbageCollectImages() {
             }
         }
     }
+#endif
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
     std::scoped_lock lock{mutex};
     bool pressured = false;
     bool aggresive = false;
+    [[maybe_unused]] bool evicted_images = false;
     u64 ticks_to_destroy = 0;
     size_t num_deletions = 0;
 
@@ -1052,6 +1097,9 @@ void TextureCache::GarbageCollectImages() {
         // bbport: critical used 160 ticks, longer than pressure's 80, so the aggressive pass
         // never freed more than the first one (#256).
         ticks_to_destroy = aggresive ? 40 : pressured ? 80 : 16;
+#ifdef UNCHARTED_UWP
+        ticks_to_destroy = aggresive ? 16 : pressured ? 32 : 64;
+#endif
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
     };
@@ -1065,9 +1113,16 @@ void TextureCache::GarbageCollectImages() {
         const bool tiled = image.info.IsTiled();
         if (tiled && download) {
             // This is a workaround for now. We can't handle non-linear image downloads.
+#ifdef UNCHARTED_UWP
+            // Keep protected images from exhausting every subsequent bounded scan.
+            lru_cache.Touch(image.lru_id, gc_tick);
+#endif
             return false;
         }
         if (download && !pressured) {
+#ifdef UNCHARTED_UWP
+            lru_cache.Touch(image.lru_id, gc_tick);
+#endif
             return false;
         }
         if (download) {
@@ -1078,6 +1133,7 @@ void TextureCache::GarbageCollectImages() {
             ++gc_downloads;
         }
         ++gc_evictions;
+        evicted_images = true;
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
@@ -1103,7 +1159,11 @@ void TextureCache::GarbageCollectImages() {
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
     // bbport: evictions under memory pressure, at most every 5 s (BB_FRAME_STATS or not).
-    if (pressured || gc_downloads != 0) {
+    if (pressured || gc_downloads != 0
+#ifdef UNCHARTED_UWP
+        || evicted_images
+#endif
+    ) {
         const auto now = std::chrono::steady_clock::now();
         if (now - gc_report_time >= std::chrono::seconds(5)) {
             std::printf("Texture cache: memory pressure, %llu of %llu MiB (critical %llu): "
@@ -1118,6 +1178,14 @@ void TextureCache::GarbageCollectImages() {
             gc_evictions = gc_downloads = 0;
         }
     }
+#ifdef UNCHARTED_UWP
+    // Deletion is fence deferred. Reclaim completed images now when headroom is low,
+    // rather than letting another frame allocate over the app limit first.
+    if (evicted_images && uncharted_uwp_app_memory_usage() >= pressure_gc_memory) {
+        scheduler.Finish();
+        scheduler.PopPendingOperations();
+    }
+#endif
 }
 
 void TextureCache::GarbageCollectSamplers() {

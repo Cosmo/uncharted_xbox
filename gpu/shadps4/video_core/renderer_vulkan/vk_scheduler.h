@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <condition_variable>
 #include <deque>
@@ -622,9 +623,21 @@ public:
     }
 
     void Execute(vk::CommandBuffer cmdbuf) {
+        static const bool trace = [] {
+            const char* env = std::getenv("BB_RECORDER_TIMINGS");
+            return env && env[0] == '1';
+        }();
         for (CommandBase* command = first; command;) {
             CommandBase* const next = command->next;
-            command->Execute(cmdbuf);
+            if (trace) {
+                const auto started = std::chrono::steady_clock::now();
+                command->Execute(cmdbuf);
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count();
+                if (ms >= 10.0) std::printf("Recorder command: %.3f ms; %s\n", ms, command->Name());
+            } else {
+                command->Execute(cmdbuf);
+            }
             command->~CommandBase();
             command = next;
         }
@@ -655,6 +668,7 @@ private:
     struct CommandBase {
         virtual ~CommandBase() = default;
         virtual void Execute(vk::CommandBuffer cmdbuf) = 0;
+        virtual const char* Name() const = 0;
         CommandBase* next{};
     };
     template <typename Func>
@@ -664,6 +678,7 @@ private:
         void Execute(vk::CommandBuffer cmdbuf) override {
             func(cmdbuf);
         }
+        const char* Name() const override { return __PRETTY_FUNCTION__; }
         Func func;
     };
 
@@ -682,14 +697,14 @@ public:
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush(SubmitInfo& info);
+    void Flush(SubmitInfo& info, std::source_location caller = std::source_location::current());
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush();
+    void Flush(std::source_location caller = std::source_location::current());
 
     /// Sends the current execution context to the GPU and waits for it to complete.
-    void Finish();
+    void Finish(std::source_location caller = std::source_location::current());
 
     /// bbport: waits for the work submitted so far but leaves the command buffer being
     /// recorded open, so a CommandBuffer() the caller holds stays valid (Finish() submits it:
@@ -697,7 +712,7 @@ public:
     void WaitSubmitted();
 
     /// Waits for the given tick to trigger on the GPU.
-    void Wait(u64 tick);
+    void Wait(u64 tick, std::source_location caller = std::source_location::current());
 
     /// bbport: prints every scheduler's timeline and the last queue submissions (GPU stall).
     static void ReportStall();
@@ -910,7 +925,13 @@ private:
 
     void RecorderThread(std::stop_token stoken);
 
-    void SubmitExecution(SubmitInfo& info);
+    void SubmitExecution(SubmitInfo& info, std::source_location caller);
+
+public:
+    /// bbport (BB_FRAME_STATS): the call sites that submitted most since the last call.
+    static std::string TakeSubmitSites();
+
+private:
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 

@@ -68,7 +68,11 @@ struct Values {
     std::atomic<float> reactive_threshold{0.2f};
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
+#ifdef UNCHARTED_UWP // Xbox alpha: the overlay is on, with FPS and the app's memory (testers report both)
+    std::atomic<bool> show_fps{true};
+#else
     std::atomic<bool> show_fps{false};
+#endif
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
     std::atomic<bool> fsr4_auto_exposure{true};
     std::atomic<bool> fsr4_invert_jitter{false};

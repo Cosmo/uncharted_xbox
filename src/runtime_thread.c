@@ -15,9 +15,13 @@
 #include <setjmp.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
 #else
+#include <dirent.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <asm/prctl.h>
@@ -46,6 +50,12 @@ typedef struct GuestThread {
     ThreadAttr attr;
     char name[32];
     int detached, finished, joined, host_owned;
+    /* What the thread waits for (runtime_wait_begin), for runtime_wait_report. */
+    const char *wait_kind;
+    char wait_object[40];
+    const void *wait_address, *wait_holder;
+    uintptr_t wait_caller;
+    uint64_t wait_since;
 #ifdef _WIN32
     bb_jmp_buf exit_jump; /* no SEH unwinding through guest frames */
 #else
@@ -135,6 +145,48 @@ void runtime_thread_attach_host(const char *name) {
 void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
+}
+/* The calling thread's record (NULL for host threads that never ran guest code): owners of guest locks. */
+void *runtime_thread_self(void) { return current; }
+static uint64_t monotonic_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec;
+}
+/* A blocking call notes what it waits for: the kind, the object's name and address, the thread holding it (if
+ * known) and the guest code that called. runtime_wait_end clears it when the call returns. */
+void runtime_wait_begin(const char *kind,const char *object,const void *address,const void *holder,uintptr_t caller) {
+    GuestThread *t=current;
+    if (!t) return;
+    snprintf(t->wait_object,sizeof(t->wait_object),"%s",object ? object : "");
+    t->wait_address=address; t->wait_holder=holder; t->wait_caller=caller;
+    t->wait_since=monotonic_ns();
+    __atomic_store_n(&t->wait_kind,kind,__ATOMIC_RELEASE);
+}
+void runtime_wait_end(void) {
+    GuestThread *t=current;
+    if (t) __atomic_store_n(&t->wait_kind,(const char *)NULL,__ATOMIC_RELEASE);
+}
+static void cpu_report(void);
+/* Every guest thread and what it waits for, then the CPU time of every thread: a hang shows as threads waiting
+ * for each other, for something nothing delivers, or as one thread busy in a loop. */
+void runtime_wait_report(void) {
+    const uint64_t now=monotonic_ns();
+    pthread_mutex_lock(&lock);
+    printf("Thread report:\n");
+    for (GuestThread *t=threads;t;t=t->next) {
+        if (t->finished) continue;
+        const char *kind=__atomic_load_n(&t->wait_kind,__ATOMIC_ACQUIRE);
+        if (!kind) { printf("  %-24s running\n",t->name); continue; }
+        char holder[48]="";
+        for (GuestThread *o=threads;t->wait_holder && o;o=o->next)
+            if (o==t->wait_holder) { snprintf(holder,sizeof(holder),", held by %s",o->name); break; }
+        const uint64_t since=t->wait_since; /* a wait that began during the report counts as new */
+        printf("  %-24s waits %.1f s for %s%s%s at %p%s, called from %p\n",t->name,since<now ? (double)(now-since)/1e9 : 0.0,kind,
+               t->wait_object[0] ? " " : "",t->wait_object,t->wait_address,holder,(void *)t->wait_caller);
+    }
+    pthread_mutex_unlock(&lock);
+    cpu_report();
+    fflush(stdout);
 }
 static GuestThread *find_thread(void *handle) {
     GuestThread *found=NULL;
@@ -333,7 +385,9 @@ static ABI int32_t thread_join(GuestThread *t,void **result) {
     if (t->detached || t->joined) return ERR(22);
     t->joined=1;
     void *value=NULL;
+    runtime_wait_begin("thread end",t->name,t,t,(uintptr_t)__builtin_return_address(0));
     int e=pthread_join(t->host,&value);
+    runtime_wait_end();
     if (e) { fprintf(stderr,"STOP: host pthread_join failed: %d\n",e); exit(21); }
     if (result) *result=t->result;
     pthread_mutex_lock(&lock); ++joined_count; pthread_mutex_unlock(&lock);
@@ -456,6 +510,98 @@ uintptr_t runtime_thread_resolve(const char *name) {
     for (size_t i=0;i<sizeof(table)/sizeof(*table);++i)
         if (!strcmp(name,table[i].nid)) return (uintptr_t)table[i].fn;
     return 0;
+}
+/* ---- CPU time per host thread (#209: which threads keep 4-thread CPUs at 100%) ---- */
+static uint64_t guest_yields, guest_zero_sleeps;
+void runtime_thread_count_yield(int zero_sleep) {
+    __atomic_fetch_add(zero_sleep ? &guest_zero_sleeps : &guest_yields,1,__ATOMIC_RELAXED);
+}
+static struct timespec session_start;
+__attribute__((constructor)) static void mark_session_start(void) { clock_gettime(CLOCK_MONOTONIC,&session_start); }
+static double seconds_since(const struct timespec *t) {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+    return (double)(now.tv_sec-t->tv_sec)+(double)(now.tv_nsec-t->tv_nsec)/1e9;
+}
+typedef struct { char name[32]; double ms; } ThreadCpu;
+enum { CPU_REPORT_MAX = 1024, CPU_REPORT_SHOWN = 15 };
+static int by_cpu_desc(const void *a,const void *b) {
+    double x=((const ThreadCpu *)a)->ms, y=((const ThreadCpu *)b)->ms;
+    return (x<y)-(x>y);
+}
+/* Live threads of this process with their CPU time; threads that already exited are not listed. */
+static size_t live_thread_cpu(ThreadCpu *out,size_t max) {
+    size_t n=0;
+#ifdef _WIN32
+    HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    if (snap==INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 entry={.dwSize=sizeof(entry)};
+    DWORD pid=GetCurrentProcessId();
+    for (BOOL ok=Thread32First(snap,&entry);ok && n<max;ok=Thread32Next(snap,&entry)) {
+        if (entry.th32OwnerProcessID!=pid) continue;
+        HANDLE h=OpenThread(THREAD_QUERY_LIMITED_INFORMATION,FALSE,entry.th32ThreadID);
+        if (!h) continue;
+        FILETIME c,e,k,u;
+        if (GetThreadTimes(h,&c,&e,&k,&u)) {
+            ThreadCpu *t=&out[n++];
+            uint64_t ticks=(((uint64_t)k.dwHighDateTime<<32)|k.dwLowDateTime)+(((uint64_t)u.dwHighDateTime<<32)|u.dwLowDateTime);
+            t->ms=(double)ticks/1e4;
+            PWSTR wide=NULL;
+            t->name[0]=0;
+            if (SUCCEEDED(GetThreadDescription(h,&wide)) && wide) {
+                WideCharToMultiByte(CP_UTF8,0,wide,-1,t->name,sizeof(t->name),NULL,NULL);
+                LocalFree(wide);
+            }
+            if (!t->name[0]) snprintf(t->name,sizeof(t->name),"tid %lu",entry.th32ThreadID);
+        }
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+#else
+    DIR *dir=opendir("/proc/self/task");
+    if (!dir) return 0;
+    long hz=sysconf(_SC_CLK_TCK);
+    for (struct dirent *d;(d=readdir(dir)) && n<max;) {
+        if (d->d_name[0]=='.') continue;
+        char path[64], line[1024];
+        snprintf(path,sizeof(path),"/proc/self/task/%s/stat",d->d_name);
+        FILE *f=fopen(path,"r");
+        if (!f) continue;
+        size_t len=fread(line,1,sizeof(line)-1,f); fclose(f);
+        line[len]=0;
+        char *open=strchr(line,'('), *close=strrchr(line,')');
+        unsigned long utime, stime;
+        /* After "(comm)": state, then fields 4..13, then utime and stime (proc(5)). */
+        if (!open || !close || sscanf(close+2,"%*c %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %lu %lu",&utime,&stime)!=2) continue;
+        ThreadCpu *t=&out[n++];
+        t->ms=(double)(utime+stime)*1000.0/(double)(hz>0 ? hz : 100);
+        snprintf(t->name,sizeof(t->name),"%.*s",(int)(close-open-1),open+1);
+    }
+    closedir(dir);
+#endif
+    return n;
+}
+static void cpu_report(void) {
+    static ThreadCpu list[CPU_REPORT_MAX];
+    size_t n=live_thread_cpu(list,CPU_REPORT_MAX);
+    double wall=seconds_since(&session_start), total=0;
+    for (size_t i=0;i<n;++i) total+=list[i].ms;
+    qsort(list,n,sizeof(*list),by_cpu_desc);
+    /* The affinity mask, so `start /affinity F` or taskset emulating a 4-thread CPU shows 4. */
+    long hw=0;
+#ifdef _WIN32
+    DWORD_PTR process_mask=0, system_mask=0;
+    if (GetProcessAffinityMask(GetCurrentProcess(),&process_mask,&system_mask)) hw=__builtin_popcountll(process_mask);
+#else
+    cpu_set_t set; CPU_ZERO(&set);
+    if (!sched_getaffinity(0,sizeof(set),&set)) hw=CPU_COUNT(&set);
+#endif
+    printf("Runtime: CPU time by thread: session %.0f s, %zu live threads, %.0f s CPU (%.0f%% of %ld hardware threads)\n",
+           wall,n,total/1000.0,wall>0 && hw>0 ? total/10.0/wall/(double)hw : 0.0,hw);
+    for (size_t i=0;i<n && i<CPU_REPORT_SHOWN;++i)
+        printf("Runtime:   %-24s %9.0f ms (%5.1f%% of one thread)\n",list[i].name,list[i].ms,wall>0 ? list[i].ms/10.0/wall : 0.0);
+    printf("Runtime: yields guest=%llu, zero sleeps=%llu\n",
+           (unsigned long long)__atomic_load_n(&guest_yields,__ATOMIC_RELAXED),
+           (unsigned long long)__atomic_load_n(&guest_zero_sleeps,__ATOMIC_RELAXED));
 }
 void runtime_thread_report(void) {
     pthread_mutex_lock(&lock);
